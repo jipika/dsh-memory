@@ -1,0 +1,19 @@
+{
+  "name": "dsh-memory",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Two-layer long-term memory (global + per-project) injected into the system prompt on every assembly, with a Settings panel to switch each layer off. Live re-read, zero extra LLM cost.",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
