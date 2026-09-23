@@ -5,7 +5,7 @@
        开关只翻一个布尔值：host 的 text 是函数，每次 assemble 求值，所以关掉/开启
        立即生效，无需重启或刷新。 */
     window.__ModuleLoader__.load({
-      id: "@jipika/dsh-memory",
+      id: "dsh-memory",
       factory: (require) => {
         var module = { exports: {} };
         var exports = module.exports;

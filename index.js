@@ -241,7 +241,8 @@ export function apply(ctx) {
       () =>
         wctx.webServer.register({
           kind: "prefix",
-          path: "/dsh-memory/",
+          // 不带尾部斜杠：dsh-host-webserver 的 match() 自己会补 "/" 再比前缀
+          path: "/dsh-memory",
           handler: handleContentRoute,
         }),
       "dsh-memory: content route",

@@ -107,7 +107,13 @@ store.projectEnabled = {};
 check(at(CWD).includes("probe project index entry"), "host: 重新开启后立即重新读取");
 
 // ── 内容路由 ────────────────────────────────────────────────────────────────
-check(routes.length === 1 && routes[0].path === "/dsh-memory/", "host: 注册只读内容路由 /dsh-memory/");
+check(routes.length === 1 && routes[0].path === "/dsh-memory", "host: 注册只读内容路由 /dsh-memory");
+// 用 dsh-host-webserver 的真实 match() 语义校验：pathname === prefix || startsWith(prefix + "/")
+// （这条断言就是为了防住"注册路径多带一个尾斜杠导致永远匹配不上"那类 bug）
+const routePath = routes[0].path;
+const wouldMatch = (pathname) => pathname === routePath || pathname.startsWith(`${routePath}/`);
+check(wouldMatch("/dsh-memory/content"), "route: 能被 /dsh-memory/content 命中（DSH match 语义）");
+check(!wouldMatch("/dsh-memory-extra/content"), "route: 不会误命中 /dsh-memory-extra");
 
 function callRoute(pathname) {
   let code = 0, body = "";
