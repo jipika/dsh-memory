@@ -6,6 +6,10 @@
 > 给 DeepSeek Harness 的**两层长期记忆**：全局层 + 项目层，纯 markdown、明文可编辑、
 > **不产生任何额外 LLM 调用**，写完即生效。
 
+[![npm](https://img.shields.io/npm/v/@jipika/dsh-memory?label=npm)](https://www.npmjs.com/package/@jipika/dsh-memory)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![DSH 1024Store](https://img.shields.io/badge/DSH%201024Store-listed-10B981)](https://deepseek1024.com/)
+
 ---
 
 ## 它解决什么
@@ -35,25 +39,39 @@ agent 顺手完成** —— 于是它既不花钱，也不出本机，还能被 
 
 ## 安装
 
+### 从 npm（推荐）
+
+已发布为 `@jipika/dsh-memory`，也收录在 [DSH 1024Store](https://deepseek1024.com/) 目录里：
+
+```bash
+dsh plugin --profile web add @jipika/dsh-memory
+```
+
+本插件自带 `cordis.patch.yml`（`package.json` 里声明了 `dsh.bundle.patch`），安装时 DSH 会自动把它
+挂进 profile 的组合树，**不需要手工编辑任何 profile 文件**。
+
+### 从源码（想改代码时）
+
 ```bash
 git clone https://github.com/jipika/dsh-memory.git ~/.dsh/local-plugins/dsh-memory
 ```
 
-然后把它加进你的 profile（以 `desktop` 为例）：
+然后以 `link:` 方式挂进 profile（以 `desktop` 为例）：
 
 ```bash
 # 1) 依赖（~/.dsh/profiles/desktop/package.json）
-#    "dsh-memory": "link:../../local-plugins/dsh-memory"
+#    "@jipika/dsh-memory": "link:../../local-plugins/dsh-memory"
 
 # 2) 挂载（~/.dsh/profiles/desktop/cordis.patch.yml 末尾追加）
 #    - insert:
 #        - id: dsh-memory
-#          name: 'dsh-memory'
+#          name: '@jipika/dsh-memory'
 
 cd ~/.dsh/profiles/desktop && pnpm install
 ```
 
-重启 DSH 一次（host 半在 boot 时加载），之后所有改动都是实时的。
+> 装完后若是 `link:` 方式，`pnpm install` 会重建 node_modules 链接并把 HMR 的基线路径换掉 —— 建议
+> **重启一次 DSH**（host 半在 boot 时加载）。之后改记忆、翻开关都不再需要重启。
 
 ## 记忆文件布局
 
