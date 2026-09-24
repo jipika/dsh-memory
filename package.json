@@ -1,8 +1,8 @@
 {
   "name": "@jipika/dsh-memory",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Two-layer long-term memory (global + per-project) injected into the system prompt on every assembly, with a Settings panel to switch each layer off. Live re-read, zero extra LLM cost.",
+  "description": "Two-layer long-term memory (global + per-project) plus the global rule files, injected into the system prompt on every assembly, with a Settings panel to view AND edit every file and switch each layer off. Live re-read, zero extra LLM cost.",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",

@@ -1,9 +1,10 @@
 (() => {
   try {
     /* dsh-memory client half —— 「设置 → 记忆」控制面板。
-       每层一个开关 + 点击标题即可就地展开该层的记忆正文（host 半的只读路由提供）。
-       开关只翻一个布尔值：host 的 text 是函数，每次 assemble 求值，所以关掉/开启
-       立即生效，无需重启或刷新。 */
+       三层内容：全局规则文件（~/.dsh/AGENTS.md）、全局记忆、按项目的记忆。
+       每层一个开关（规则层没有开关），点标题就地展开：可看正文、也可直接编辑并保存。
+       正文与写回都走 host 半的路由（/dsh-memory/content 读、/dsh-memory/write 写），
+       开关只翻一个布尔值：host 的 text 是函数，每次 assemble 求值，所以关掉/开启立即生效。 */
     window.__ModuleLoader__.load({
       id: "@jipika/dsh-memory",
       factory: (require) => {
@@ -31,10 +32,24 @@
           ".dm-caret[data-open='true']{transform:rotate(90deg)}",
           ".dm-sub{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
           ".dm-off .dm-name{color:var(--dsw-alias-label-tertiary)}",
-          ".dm-view{margin:0;max-height:360px;overflow:auto;border-top:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-2);padding:10px 12px;font-family:var(--dsw-font-markdown-code-block-small,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11px;line-height:17px;white-space:pre-wrap;word-break:break-word;color:var(--dsw-alias-label-secondary)}",
+          ".dm-body{display:flex;flex-direction:column;border-top:.5px solid var(--dsw-alias-border-l3)}",
+          ".dm-tabs{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px 0;background:var(--dsw-alias-bg-layer-2)}",
+          ".dm-tab{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:16px;padding:3px 9px;border:.5px solid var(--dsw-alias-border-l3);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
+          ".dm-tab:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+          ".dm-tab-on{background:var(--dsw-alias-brand-primary);border-color:transparent;color:var(--dsw-alias-label-primary-foreground)}",
+          ".dm-tools{display:flex;align-items:center;gap:8px;justify-content:flex-end;padding:6px 12px;background:var(--dsw-alias-bg-layer-2)}",
+          ".dm-status{margin-right:auto;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}",
+          ".dm-btn{flex:0 0 auto;font-size:11px;line-height:16px;padding:3px 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer}",
+          ".dm-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
+          ".dm-btn:disabled{opacity:.45;cursor:default}",
+          ".dm-btn-primary{background:var(--dsw-alias-brand-primary);border-color:transparent;color:var(--dsw-alias-label-primary-foreground)}",
+          ".dm-view{margin:0;max-height:360px;overflow:auto;background:var(--dsw-alias-bg-layer-2);padding:10px 12px;font-family:var(--dsw-font-markdown-code-block-small,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11px;line-height:17px;white-space:pre-wrap;word-break:break-word;color:var(--dsw-alias-label-secondary)}",
           ".dm-empty{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
           ".dm-note{margin:0;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}",
+          ".dm-layer-note{padding:6px 12px 10px;background:var(--dsw-alias-bg-layer-2)}",
           ".dm-err{color:var(--dsw-alias-state-error-primary)}",
+          ".dm-editor{display:block;box-sizing:border-box;width:100%;min-height:220px;max-height:420px;resize:vertical;border:0;background:var(--dsw-alias-bg-layer-2);padding:10px 12px;font-family:var(--dsw-font-markdown-code-block-small,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11px;line-height:17px;white-space:pre;overflow:auto;color:var(--dsw-alias-label-primary);outline:none}",
+          ".dm-editor:focus{box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}",
           ".dm-switch{box-sizing:border-box;position:relative;flex:0 0 auto;width:36px;height:20px;padding:2px;border:0;border-radius:10px;background:var(--dsw-alias-border-l3);cursor:pointer;transition:background 120ms ease}",
           ".dm-switch[aria-checked='true']{background:var(--dsw-alias-brand-primary)}",
           ".dm-switch:disabled{cursor:default;opacity:.5}",
@@ -137,8 +152,14 @@
           return parts[parts.length - 1] || s;
         }
 
+        /** 面板里三层内容的序号：每次请求 +1，用来丢弃过期响应。 */
+        var requestSeq = 0;
+
+        /** 编辑缓冲的 key（target + 文件名）。 */
+        function keyOf(target, name) { return target + "::" + name; }
+
         /**
-         * 设置分栏本体：全局层 + 项目层，每项可点开看正文。
+         * 设置分栏本体：全局规则 + 全局层 + 项目层。每项可展开看正文，并可就地编辑保存。
          */
         function MemoryPane() {
           var snap = react.useSyncExternalStore(setting.store.subscribe, setting.store.getSnapshot, setting.store.getSnapshot);
@@ -150,39 +171,259 @@
           var openPair = react.useState(null);
           var open = openPair[0];
           var setOpen = openPair[1];
-          var contentPair = react.useState({ status: "idle", text: "" });
-          var content = contentPair[0];
-          var setContent = contentPair[1];
+          var layerPair = react.useState({ status: "idle", files: [], error: "" });
+          var layer = layerPair[0];
+          var setLayer = layerPair[1];
+          var pickedPair = react.useState({});
+          var picked = pickedPair[0];
+          var setPicked = pickedPair[1];
+          var draftPair = react.useState({});
+          var draft = draftPair[0];
+          var setDraft = draftPair[1];
+          var savePair = react.useState({ status: "idle", text: "" });
+          var saveState = savePair[0];
+          var setSaveState = savePair[1];
+          var editPair = react.useState(false);
+          var editing = editPair[0];
+          var setEditing = editPair[1];
 
-          var toggleView = function (target) {
-            if (open === target) { setOpen(null); return; }
-            setOpen(target);
-            setContent({ status: "loading", text: "" });
+          /** 拉取某一层的正文（含层内全部文件）。 */
+          var load = function (target) {
+            var seq = ++requestSeq;
+            setLayer({ status: "loading", files: [], error: "" });
             fetch("/dsh-memory/content?target=" + encodeURIComponent(target))
-              .then(function (r) { return r.ok ? r.text() : Promise.reject(new Error("HTTP " + r.status)); })
-              .then(function (t) { setContent({ status: "ready", text: t }); })
-              .catch(function (e) { setContent({ status: "error", text: String((e && e.message) || e) }); });
+              .then(function (r) {
+                return r.json().then(function (j) {
+                  if (!r.ok || !j || j.ok !== true) throw new Error((j && j.error) || ("HTTP " + r.status));
+                  return j;
+                });
+              })
+              .then(function (j) {
+                if (seq !== requestSeq) return;
+                setLayer({ status: "ready", files: j.files || [], error: "" });
+              })
+              .catch(function (e) {
+                if (seq !== requestSeq) return;
+                setLayer({ status: "error", files: [], error: String((e && e.message) || e) });
+              });
           };
 
-          var item = function (target, name, sub, checked, onToggle, label) {
-            var isOpen = open === target;
-            var body = null;
-            if (isOpen) {
-              var text = content.status === "loading"
-                ? "读取中…"
-                : content.status === "error"
-                  ? "读取失败：" + content.text + "（若为 HTTP 403，说明该路由被部署的访问控制拦截）"
-                  : content.text;
-              body = react.createElement("pre", {
-                className: content.status === "error" ? "dm-view dm-err" : "dm-view",
-              }, text);
+          /** 展开 / 收起一层。 */
+          var toggleOpen = function (target) {
+            if (open === target) { setOpen(null); return; }
+            setOpen(target);
+            setEditing(false);
+            setSaveState({ status: "idle", text: "" });
+            load(target);
+          };
+
+          /** 保存一个文件（走 host 的写路由）。 */
+          var save = function (target, name, text) {
+            var key = keyOf(target, name);
+            setSaveState({ status: "saving", text: "保存中…" });
+            fetch("/dsh-memory/write", {
+              method: "POST",
+              headers: { "content-type": "application/json", "x-dsh-memory": "1" },
+              body: JSON.stringify({ target: target, file: name, text: text }),
+            })
+              .then(function (r) {
+                return r.json().then(function (j) {
+                  if (!r.ok || !j || j.ok !== true) throw new Error((j && j.error) || ("HTTP " + r.status));
+                  return j;
+                });
+              })
+              .then(function (j) {
+                if (target === open) {
+                  setLayer(function (prev) {
+                    return {
+                      status: "ready",
+                      error: "",
+                      files: prev.files.map(function (f) {
+                        return f.name === name ? Object.assign({}, f, { text: text, exists: true }) : f;
+                      }),
+                    };
+                  });
+                }
+                setDraft(function (prev) {
+                  var next = Object.assign({}, prev);
+                  delete next[key];
+                  return next;
+                });
+                setSaveState({ status: "saved", text: j && j.changed === false ? "已保存（内容未变）" : "已保存" });
+              })
+              .catch(function (e) {
+                setSaveState({ status: "error", text: "保存失败：" + String((e && e.message) || e) });
+              });
+          };
+
+          /** 展开体：文件切换 + 查看/编辑 + 保存。 */
+          var renderBody = function (target, note) {
+            if (layer.status === "loading") {
+              return react.createElement("div", { className: "dm-body" }, react.createElement("p", { className: "dm-view" }, "读取中…"));
             }
+            if (layer.status === "error") {
+              return react.createElement(
+                "div",
+                { className: "dm-body" },
+                react.createElement("p", { className: "dm-view dm-err" }, "读取失败：" + layer.error + "（若为 HTTP 403，说明该路由被部署的访问控制拦截）"),
+              );
+            }
+            var files = layer.files || [];
+            if (files.length === 0) {
+              return react.createElement("div", { className: "dm-body" }, react.createElement("p", { className: "dm-view" }, "(无文件)"));
+            }
+            var activeName = picked[target] !== void 0 && files.some(function (f) { return f.name === picked[target]; })
+              ? picked[target]
+              : files[0].name;
+            var file = files[0];
+            for (var i = 0; i < files.length; i += 1) if (files[i].name === activeName) file = files[i];
+            var key = keyOf(target, activeName);
+            var buffered = draft[key];
+            var text = buffered === void 0 ? file.text : buffered;
+            var dirty = buffered !== void 0 && buffered !== file.text;
+
+            var tabs = files.length > 1
+              ? react.createElement(
+                  "div",
+                  { className: "dm-tabs" },
+                  files.map(function (f) {
+                    var bufferedFile = draft[keyOf(target, f.name)];
+                    var fileDirty = bufferedFile !== void 0 && bufferedFile !== f.text;
+                    return react.createElement(
+                      "button",
+                      {
+                        key: f.name,
+                        type: "button",
+                        className: f.name === activeName ? "dm-tab dm-tab-on" : "dm-tab",
+                        title: (f.path || f.name) + (f.injected ? "（注入系统提示词）" : "（按需读取的主题文件）"),
+                        onClick: function () {
+                          setPicked(function (prev) {
+                            var next = Object.assign({}, prev);
+                            next[target] = f.name;
+                            return next;
+                          });
+                          setEditing(false);
+                          setSaveState({ status: "idle", text: "" });
+                        },
+                      },
+                      f.name + (fileDirty ? " ●" : ""),
+                    );
+                  }),
+                )
+              : null;
+
+            var statusText = layer.status !== "ready"
+              ? ""
+              : saveState.status === "saving"
+                ? "保存中…"
+                : dirty
+                  ? "未保存"
+                  : saveState.text !== ""
+                    ? saveState.text
+                    : file.exists ? "" : "该文件还不存在，保存即创建";
+            var tools = react.createElement(
+              "div",
+              { className: "dm-tools" },
+              react.createElement(
+                "span",
+                { className: saveState.status === "error" ? "dm-status dm-err" : "dm-status" },
+                statusText,
+              ),
+              editing
+                ? react.createElement(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dm-btn",
+                      onClick: function () {
+                        setDraft(function (prev) {
+                          var next = Object.assign({}, prev);
+                          delete next[key];
+                          return next;
+                        });
+                        setEditing(false);
+                        setSaveState({ status: "idle", text: "" });
+                      },
+                    },
+                    "取消",
+                  )
+                : null,
+              editing
+                ? react.createElement(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dm-btn dm-btn-primary",
+                      disabled: !dirty || saveState.status === "saving",
+                      onClick: function () { save(target, activeName, text); },
+                    },
+                    "保存",
+                  )
+                : react.createElement(
+                    "button",
+                    {
+                      type: "button",
+                      className: "dm-btn",
+                      onClick: function () {
+                        setDraft(function (prev) {
+                          var next = Object.assign({}, prev);
+                          if (next[key] === void 0) next[key] = file.text;
+                          return next;
+                        });
+                        setEditing(true);
+                        setSaveState({ status: "idle", text: "" });
+                      },
+                    },
+                    "编辑",
+                  ),
+            );
+
+            var content = editing
+              ? react.createElement("textarea", {
+                  className: "dm-editor",
+                  spellCheck: false,
+                  value: text,
+                  onChange: function (event) {
+                    var next = event.target.value;
+                    setDraft(function (prev) {
+                      var merged = Object.assign({}, prev);
+                      merged[key] = next;
+                      return merged;
+                    });
+                  },
+                  onKeyDown: function (event) {
+                    if ((event.metaKey || event.ctrlKey) && (event.key === "s" || event.key === "S")) {
+                      event.preventDefault();
+                      var current = draft[key];
+                      if (current !== void 0 && current !== file.text) save(target, activeName, current);
+                    }
+                  },
+                })
+              : react.createElement(
+                  "pre",
+                  { className: "dm-view" },
+                  file.exists ? (file.text === "" ? "(空文件)" : file.text) : "(文件不存在 —— 点「编辑」即可创建)",
+                );
+
             return react.createElement(
               "div",
-              { className: checked ? "dm-item" : "dm-item dm-off", key: target },
+              { className: "dm-body" },
+              tabs,
+              tools,
+              content,
+              note ? react.createElement("p", { className: "dm-note dm-layer-note" }, note) : null,
+            );
+          };
+
+          /** 一层 = 一行（标题可点开）+ 展开体。 */
+          var item = function (target, label, sub, toggleProps, note) {
+            var isOpen = open === target;
+            return react.createElement(
+              "div",
+              { className: toggleProps !== null && toggleProps !== void 0 && toggleProps.checked === false ? "dm-item dm-off" : "dm-item", key: target },
               react.createElement(
                 "div",
-                { className: "dm-row", onClick: function () { toggleView(target); }, title: "点击查看内容" },
+                { className: "dm-row", onClick: function () { toggleOpen(target); }, title: "点击展开：查看并编辑" },
                 react.createElement(
                   "div",
                   { className: "dm-main" },
@@ -190,13 +431,19 @@
                     "span",
                     { className: "dm-name" },
                     react.createElement("span", { className: "dm-caret", "data-open": isOpen ? "true" : "false" }, "▶"),
-                    name,
+                    label,
                   ),
                   react.createElement("span", { className: "dm-sub" }, sub),
                 ),
-                react.createElement(Toggle, { checked: checked, onToggle: onToggle, label: label }),
+                toggleProps === null || toggleProps === void 0
+                  ? null
+                  : react.createElement(Toggle, {
+                      checked: toggleProps.checked,
+                      onToggle: toggleProps.onToggle,
+                      label: toggleProps.label,
+                    }),
               ),
-              body,
+              isOpen ? renderBody(target, note) : null,
             );
           };
 
@@ -208,13 +455,16 @@
                   slug,
                   shortName(slug),
                   slug,
-                  enabled,
-                  function () {
-                    var next = Object.assign({}, projectEnabled);
-                    next[slug] = !enabled;
-                    return setting.set("projectEnabled", next);
+                  {
+                    checked: enabled,
+                    onToggle: function () {
+                      var next = Object.assign({}, projectEnabled);
+                      next[slug] = !enabled;
+                      return setting.set("projectEnabled", next);
+                    },
+                    label: shortName(slug) + " 记忆开关",
                   },
-                  shortName(slug) + " 记忆开关",
+                  "项目层在每个会话的提示词组装时实时重读：保存后下一条消息即生效。MEMORY.md 是注入入口（索引），其余 .md 是按需读取的主题文件。",
                 );
               });
 
@@ -225,8 +475,20 @@
             react.createElement(
               "p",
               { className: "dm-intro" },
-              "两层长期记忆：全局层（所有项目）+ 项目层（按当前工作区）。点标题即可展开看正文；" +
-                "开关关掉的那一层不再注入系统提示词，再次开启时立即重新读取文件。",
+              "三层内容：全局规则文件（所有会话都读）+ 全局记忆 + 按工作区的项目记忆。" +
+                "点任意一行即可展开正文并就地编辑保存；开关关掉的那一层不再注入系统提示词，再次开启时立即重新读取文件。",
+            ),
+            react.createElement("h3", { className: "dm-group-title" }, "全局规则文件"),
+            react.createElement(
+              "div",
+              { className: "dm-group" },
+              item(
+                "rules",
+                "AGENTS.md",
+                "~/.dsh/AGENTS.md · 全局指令（每个新会话开头注入）",
+                null,
+                "AGENTS.md 由 DSH 原生的 workspace instructions 读取：改完对新会话生效（当前会话不一定立刻重读）。",
+              ),
             ),
             react.createElement("h3", { className: "dm-group-title" }, "全局层（跨项目）"),
             react.createElement(
@@ -236,9 +498,12 @@
                 "global",
                 "全局记忆",
                 "~/.dsh/memory.md · 用户偏好 / 环境事实 / 通用坑",
-                globalEnabled,
-                function () { return setting.set("globalEnabled", !globalEnabled); },
-                "全局记忆开关",
+                {
+                  checked: globalEnabled,
+                  onToggle: function () { return setting.set("globalEnabled", !globalEnabled); },
+                  label: "全局记忆开关",
+                },
+                "每次提示词组装都重读该文件：保存后下一条消息即生效，无需重启。保存前若内容有变化，旧版本自动留一份 memory.md.bak。",
               ),
             ),
             react.createElement("h3", { className: "dm-group-title" }, "项目层（按工作区）"),
@@ -247,7 +512,7 @@
               "p",
               { className: "dm-note" },
               "开关状态存 ~/.dsh/settings.yaml 的 dsh-memory 节；项目列表由 host 扫描 ~/.dsh/memory/projects/ 自动维护；" +
-                "正文由 host 的只读路由 /dsh-memory/content 提供。",
+                "正文读写由 host 的 /dsh-memory/content 与 /dsh-memory/write 提供（路径白名单，越不出记忆目录与规则文件）。",
             ),
           );
         }

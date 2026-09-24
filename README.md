@@ -1,10 +1,11 @@
 # dsh-memory
 
-> Two-layer long-term memory for **DeepSeek Harness (DSH)** — global + per-project, plain
-> markdown, **zero extra LLM cost**, effective the moment you write.
+> Two-layer long-term memory for **DeepSeek Harness (DSH)** — global + per-project, plus the
+> global rule files. Plain markdown, **viewable and editable right in DSH Settings**,
+> **zero extra LLM cost**, effective the moment you write.
 >
-> 给 DeepSeek Harness 的**两层长期记忆**：全局层 + 项目层，纯 markdown、明文可编辑、
-> **不产生任何额外 LLM 调用**，写完即生效。
+> 给 DeepSeek Harness 的**两层长期记忆**：全局层 + 项目层，外加全局规则文件。纯 markdown、
+> **在设置里就能查看并编辑**、**不产生任何额外 LLM 调用**，写完即生效。
 
 [![npm](https://img.shields.io/npm/v/@jipika/dsh-memory?label=npm)](https://www.npmjs.com/package/@jipika/dsh-memory)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -33,7 +34,9 @@ agent 顺手完成** —— 于是它既不花钱，也不出本机，还能被 
   （对比：`cordis.patch.yml` 里 `personaPrefix` 的 `!!js` 只在 boot 求值一次。）
 - **索引注入，不炸上下文**：项目记忆只注入 `MEMORY.md`（一个 `- [标题](文件.md) — 摘要` 的索引），
   主题正文按需读。上千行的记忆库也只占固定的索引体积。
-- **设置面板**：DSH 设置里多一个「记忆」分栏 —— 每层一个开关，**点标题即可展开看正文**。
+- **设置面板可读可写**：DSH 设置里多一个「记忆」分栏 —— 每层一个开关，点标题即可展开正文，
+  还能**就地把改动保存回文件**（保存前自动留一份 `.bak`）。同一个分栏里可以查看并编辑
+  **全局规则文件** `~/.dsh/AGENTS.md`。
 - **明文、可移植**：就是 markdown。可以 git、可以 diff、可以手改；删掉文件即停用（段渲染为空串，
   被 `renderPrompt()` 过滤，零残留）。
 
@@ -77,6 +80,7 @@ cd ~/.dsh/profiles/desktop && pnpm install
 
 ```
 ~/.dsh/memory.md                                  ← 全局层（整个文件注入）
+~/.dsh/AGENTS.md                                  ← 全局规则（新会话注入，面板里也能编辑）
 ~/.dsh/memory/projects/
   ├── --Users-me-code-repo--/                     ← 项目层：目录形式
   │   ├── MEMORY.md                               ← 注入这一份（索引）
@@ -116,10 +120,20 @@ Memory upkeep (long-term memory):
 
 ## 设置面板
 
-设置里会出现一个「记忆」分栏：
+设置里会出现一个「记忆」分栏，三组内容：
 
-- 全局层一个开关；项目层每个项目一个开关（项目列表由 host 扫描记忆目录自动维护）。
-- **点任意一行的标题即可就地展开该层的正文**（由 host 的只读路由 `/dsh-memory/content` 提供）。
+| 分组 | 条目 | 可编辑的文件 |
+|---|---|---|
+| 全局规则文件 | AGENTS.md（无开关） | `~/.dsh/AGENTS.md` |
+| 全局层（跨项目） | 全局记忆（带开关） | `~/.dsh/memory.md` |
+| 项目层（按工作区） | 每个项目一行（带开关） | 该项目目录下的全部 `.md`（`MEMORY.md` + 主题文件） |
+
+- 点任意一行展开：先看到只读正文，点「编辑」变成可写的编辑器，`⌘/Ctrl + S` 或「保存」写回文件。
+- 一层里有多个文件时（项目记忆的主题文件），用页签切换；**未保存的页签带 `●`**。
+- 保存是**原子写**（先写临时文件再 rename），改动前的内容自动留一份 `<文件名>.bak`；
+  新建的文件用 `0600`，已有文件沿用原权限。
+- `AGENTS.md` 的生效时机（面板底部也写了）：它在每个新会话开头注入，改完对**新会话**生效。
+- 记忆两层是**每次提示词组装时实时重读**的：保存后下一条消息就带上新内容，不需要重启。
 - 关掉的那一层不再注入；再次开启**立即重新读取**文件。
 - 开关状态存在 `~/.dsh/settings.yaml` 的 `dsh-memory` 节：
 
@@ -149,8 +163,16 @@ ctx.systemPrompt.section({
 
 - 一个 settings namespace（`dsh-memory`）承载开关与自动维护的项目清单；
   host 半用手写 schema —— 插件装在 `node_modules` 之外，解析不到 `schemastery`。
-- 一条只读 HTTP 路由 `GET /dsh-memory/content?target=global|<slug>`（`target` 走白名单校验，
-  拒绝 `..` 与路径分隔符，无法越出记忆目录）。
+- 两条 HTTP 路由（读写共用同一个白名单解析函数，越不出记忆目录与规则文件）：
+
+```http
+GET  /dsh-memory/content?target=global|rules|<slug>[&file=<名>][&format=text]
+POST /dsh-memory/write   { target, file, text }     # 需请求头 x-dsh-memory: 1
+```
+
+`target` 只认 `global`（`~/.dsh/memory.md`）、`rules`（`~/.dsh/` 下的两个规则文件）、
+或形如 `--Users-me-code-repo--` 的项目 slug；`file` 只认该层里真实存在的 `.md`（或 `MEMORY.md` 新建）。
+写路由要求 `x-dsh-memory: 1` —— 浏览器跨站简单请求带不上自定义头，省掉一整类 CSRF。
 
 ## 验证
 
@@ -158,9 +180,10 @@ ctx.systemPrompt.section({
 node tests/probe.mjs
 ```
 
-28 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
-cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开、内容路由（含路径穿越被拒）、
-以及面板渲染与行点击展开。
+81 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
+cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开、读路由（层内文件清单、AGENTS.md、
+单文件形式、路径穿越被拒）、写路由（原子写、`.bak` 回滚点、权限保留、首次建 MEMORY.md、内容未变不重复写、
+白名单外写不进去、缺 `x-dsh-memory` 头 → 403），以及设置面板的渲染与「展开 → 编辑 → 保存」全流程。
 
 ## 兼容性
 
