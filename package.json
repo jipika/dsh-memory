@@ -1,6 +1,6 @@
 {
   "name": "@jipika/dsh-memory",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "description": "Progressive long-term memory for DSH: sharded markdown bodies under ~/.dsh/memory/topics/, with only a live-generated index (shard · count · path · per-entry line numbers) injected into the system prompt — so the prompt cost stays flat however large the memory grows. Two layers (global + per-project) plus the global rule files, viewable AND editable in DSH Settings, with per-layer switches and an index/full injection toggle. Zero extra LLM cost, live re-read.",
   "main": "./index.js",

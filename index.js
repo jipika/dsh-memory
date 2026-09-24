@@ -430,6 +430,56 @@ function injectMode() {
 }
 
 /**
+ * 项目层（**目录形式**）的注入正文。
+ *
+ * 与全局层 / 单文件形式刻意不同：项目目录里索引与正文已经分好家 —— `MEMORY.md` 是人写的
+ * 索引（`- [标题](文件.md) — 摘要`，本身就是「标题 → 路径」），其余 `.md` 是正文（带 YAML
+ * frontmatter 的段落，不是条目）。所以这里直接注入索引正文，另外只列出**没被索引登记的**
+ * 正文文件。对正文再套一遍条目索引只会退化成一张纯路径清单 —— 实测 traffic 项目：
+ * 74 片 / 474 条 / 176k 字符被压成 14340 字符的文件列表，而 MEMORY.md 的摘要在退化成
+ * 「索引预算已满」后**一个字都没注入**。
+ *
+ * @param {string} cwd - 工作目录（写进注释头）。
+ * @param {string} dir - 该项目记忆目录。
+ * @returns {string} 注入正文（无内容时为空串）。
+ */
+function renderProjectDir(cwd, dir) {
+  const indexPath = `${dir}/MEMORY.md`;
+  const indexText = readOrEmpty(indexPath).trim();
+  const others = [];
+  try {
+    for (const name of readdirSync(dir).sort()) {
+      if (!name.endsWith(".md") || name === "MEMORY.md") continue;
+      const path = `${dir}/${name}`;
+      try {
+        if (statSync(path).isFile()) others.push({ name, path, size: readOrEmpty(path).length });
+      } catch {
+        /* 单个文件不可读就跳过 */
+      }
+    }
+  } catch {
+    /* 目录不可读时按「只有索引」处理 */
+  }
+  if (!indexText && others.length === 0) return "";
+
+  const refs = new Set([...indexText.matchAll(/\]\(([^)]+)\)/g)].map((m) => m[1].split("/").pop()));
+  const orphans = others.filter((f) => !refs.has(f.name));
+  const entries = (indexText.match(/^\s*-\s*\[/gm) ?? []).length;
+  const parts = [
+    `<!-- 项目记忆 · ${cwd} · 目录形式：索引 ${entries} 条 / 正文 ${others.length} 篇，正文按需 read -->`,
+  ];
+  if (indexText) {
+    parts.push("", `## 索引 (MEMORY.md) → ${indexPath}`, "", clamp(indexText, indexPath));
+  }
+  if (orphans.length > 0) {
+    parts.push("", "## 未被索引登记的正文（要么读它，要么把它补进 MEMORY.md）");
+    for (const f of orphans) parts.push(`- ${f.name} (${(f.size / 1000).toFixed(1)}k)`);
+  }
+  parts.push("", `<!-- 写入本层：正文写进对应主题文件，并在 MEMORY.md 补一行 \`- [标题](文件.md) — 摘要\` -->`);
+  return parts.join("\n");
+}
+
+/**
  * 扫描项目记忆目录，得到全部 slug（目录形式与单文件形式都算）。
  * @returns {string[]} 排序后的 slug 列表。
  */
@@ -498,13 +548,14 @@ function compose(context) {
       const indexPath = `${dir}/MEMORY.md`;
       const filePath = `${PROJECT_DIR}/${slug}.md`;
       if (index) {
-        // 目录形式（MEMORY.md + 主题文件）与单文件形式都走同一套索引
-        const files = isDir(dir) ? layerFiles(dir, "") : layerFiles("", filePath);
-        const body = renderIndexBudgeted(`项目记忆 · ${cwd}`, files);
+        // 目录形式：MEMORY.md 已是人写索引，走「索引正文 + 孤儿正文清单」
+        // 单文件形式：本身就是条目集合，才值得索引化
+        const dirShape = isDir(dir);
+        const body = dirShape ? renderProjectDir(cwd, dir) : renderIndexBudgeted(`项目记忆 · ${cwd}`, layerFiles("", filePath));
         if (body) {
           blocks.push(
             neutralizePromptVars(
-              `${body}\n\n<!-- 写入本层：往上面某一片追加一行，或在同一目录新建主题文件（引用保持一层深，别做索引套索引） -->`,
+              dirShape ? body : `${body}\n\n<!-- 写入本层：在本文件末尾按分组追加一行 \`- [YYYY-MM-DD] 事实\` -->`,
             ),
           );
         }

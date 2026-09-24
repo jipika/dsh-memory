@@ -149,6 +149,22 @@ store.injectMode = "index";
 rmSync(join(TOPICS, "probe-shard.md"));
 check(!at(CWD).includes("探针分片"), "index: 分片删掉后回落单文件（两种形态都工作）");
 
+// ── 项目层（目录形式）：注入人写索引，只额外列**未被登记**的正文 ──────────────
+const projDir = join(HOME, ".dsh/memory/projects", SLUG);
+check(at(CWD).includes("probe project index entry"), "project: 目录形式注入 MEMORY.md 的索引正文（含摘要）");
+check(at(CWD).includes("索引 (MEMORY.md)"), "project: 明确标注这是人写索引");
+check(!at(CWD).includes("demo-topic.md ("), "project: 已登记的主题文件不重复列进清单");
+check(!at(CWD).includes("（0 条"), "project: 不会把正文按条目索引（旧实现退化成路径清单）");
+
+writeFileSync(join(projDir, "orphan-topic.md"), "# orphan\n\n没被索引登记\n");
+check(at(CWD).includes("未被索引登记的正文"), "project: 未登记的正文有独立分组");
+check(/\n- orphan-topic\.md \(/.test(at(CWD)), "project: 孤儿正文连同体量一起列出");
+
+writeFileSync(join(projDir, "MEMORY.md"), `${INDEX_TEXT}- [Orphan](orphan-topic.md) — 补登记\n`);
+check(!at(CWD).includes("未被索引登记的正文"), "project: 补登记进 MEMORY.md 后不再算孤儿");
+rmSync(join(projDir, "orphan-topic.md"));
+writeFileSync(join(projDir, "MEMORY.md"), INDEX_TEXT);
+
 // ── 路由脚手架 ──────────────────────────────────────────────────────────────
 check(routes.length === 1 && routes[0].path === "/dsh-memory", "host: 注册内容/写入路由 /dsh-memory");
 // 用 dsh-host-webserver 的真实 match() 语义校验：pathname === prefix || startsWith(prefix + "/")
