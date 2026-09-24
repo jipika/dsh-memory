@@ -79,6 +79,7 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 const host = await import("../index.js");
 const sections = [];
 const routes = [];
+const mountedHooks = {};
 const store = { globalEnabled: true, projectEnabled: {}, knownProjects: [] };
 const fakeScope = {
   get: () => store,
@@ -87,6 +88,7 @@ const fakeScope = {
 };
 host.apply({
   effect: (fn) => fn(),
+  on: (event, handler) => { mountedHooks[event] = handler; return () => {}; },
   systemPrompt: { section: (s) => { sections.push(s); return () => {}; } },
   inject: (deps, cb) => {
     if (deps.includes("settings")) cb({ settings: { register: () => fakeScope } });
@@ -347,7 +349,10 @@ check(strings.includes("项目层（按工作区）"), "client: 面板含项目�
 let rows = collect(pane, (n) => n.props?.className === "dm-row");
 check(rows.length === 3, `client: 三行（规则 / 全局 / 1 个项目），实际 ${rows.length}`);
 const switches = collect(pane, (n) => n.props?.role === "switch");
-check(switches.length === 2, `client: 规则层没有开关，其余每层一个（共 ${switches.length}）`);
+check(switches.length === 5, `client: 每层一个开关 + 钩子区 3 个（纪律/读取提醒/审计），实际 ${switches.length}`);
+check(strings.includes("写入 / 读取钩子") && strings.includes("写入守卫"), "client: 面板含「写入 / 读取钩子」区块");
+check(strings.includes("规则引擎（默认）") && strings.includes("规则 + 外部命令"), "client: 写入守卫三态 chips 渲染");
+check(strings.includes("读取纪律块") && strings.includes("写入审计") && strings.includes("读取提醒"), "client: 钩子区三个开关行渲染");
 
 // ── 展开全局记忆 → 编辑 → 保存 ──────────────────────────────────────────────
 await rows[1].props.onClick();
@@ -422,6 +427,122 @@ pane = render();
 check(collect(pane, (n) => n.props?.className === "dm-editor")[0].props.value === "# draft index\n", "client: 切走再切回，草稿仍在");
 
 // ── 输出 ────────────────────────────────────────────────────────────────────
+// ══ 钩子系统 ═════════════════════════════════════════════════════════════════
+// 路径归属：每个记忆形态一层，越出管辖返回 null
+check(host.memoryTargetOf(`${HOME}/.dsh/memory.md`).kind === "global-single", "hook: memory.md → global-single");
+check(host.memoryTargetOf(`${HOME}/.dsh/AGENTS.md`).kind === "rules", "hook: AGENTS.md → rules");
+check(host.memoryTargetOf(`${HOME}/.dsh/memory/topics/plugins.md`).kind === "topic", "hook: topics/*.md → topic");
+check(host.memoryTargetOf(`${HOME}/.dsh/memory/projects/${SLUG}/MEMORY.md`).kind === "project-index", "hook: 项目 MEMORY.md → project-index");
+check(host.memoryTargetOf(`${HOME}/.dsh/memory/projects/${SLUG}/demo-topic.md`).kind === "project-body", "hook: 项目正文 → project-body");
+check(host.memoryTargetOf(`${HOME}/.dsh/memory/projects/--x-y--.md`).kind === "project-single", "hook: 单文件项目 → project-single");
+check(host.memoryTargetOf(`${HOME}/.dsh/memory/audit.log`)?.kind === "plugin-internal", "hook: audit.log → plugin-internal");
+check(host.memoryTargetOf(`${HOME}/.dsh/memory/topics/plugins.md.bak`)?.kind === "plugin-internal", "hook: .bak → plugin-internal");
+check(host.memoryTargetOf("/etc/hosts") === null, "hook: 记忆之外不管");
+
+check(host.validEntryDate("2026-01-01") === true && host.validEntryDate(new Date().toISOString().slice(0, 10)) === true, "hook: 过去/今天日期合法");
+check(host.validEntryDate("2099-01-01") === false && host.validEntryDate("2026-13-45") === false && host.validEntryDate("垃圾") === false, "hook: 未来/翻滚/垃圾日期拒绝");
+check(host.extractEntries("- [2026-01-01] a\n普通行\n- [2026-01-02] b").length === 2, "hook: 条目提取只认 - [日期] 行");
+check(host.extractEntries("- [标题](x.md) — 摘要", true).length === 1 && host.extractEntries("- [标题](x.md) — 摘要").length === 0, "hook: 索引链接行只在 indexShape 下算条目");
+check(host.lineDiff("a\nb\n", "a\nc\n").added.join() === "c" && host.lineDiff("a\nb\n", "a\nc\n").removed.join() === "b", "hook: 行级 diff 增删各归其位");
+check(host.scanSecrets("token = abcdef123456789\n普通文字").length === 1, "hook: 凭据赋值命中");
+check(host.scanSecrets("sk-abcdefABCDEF123456\npassword: 'longpassword123'").length === 2, "hook: sk- 键与 password 命中");
+check(host.scanSecrets("这是一条普通记忆，没有任何凭据").length === 0, "hook: 普通文本不误报");
+
+const D = (decision, reason, notes) => ({ decision, reason, notes });
+check(host.mergeDecisions(D("allow"), D("deny", "x")).decision === "deny", "hook: 决策合并 deny 胜出");
+check(host.mergeDecisions(D("ask", "y"), D("allow")).decision === "ask", "hook: 决策合并 ask 胜出");
+check(host.mergeDecisions(D("allow", "", ["n1"]), D("allow", "", ["n2"])).notes.join() === "n1,n2", "hook: 决策合并 notes 累积");
+
+// 规则引擎：各拒绝路径与放行路径
+const TOPIC = `${HOME}/.dsh/memory/topics/probe-hook.md`;
+const denyOf = (p) => host.runWriteRules(p).decision === "deny";
+check(denyOf({ target: { kind: "plugin-internal" }, added: [] }), "hook: 规则 — 内部资产（.bak/审计）deny");
+check(denyOf({ target: { kind: "global-single" }, added: ["- [2026-01-01] 写进索引的条目"], removed: [] }), "hook: 规则 — 往 memory.md 写条目 deny");
+check(denyOf({ target: { kind: "topic" }, added: ["- [某天] 格式不对"], removed: [] }), "hook: 规则 — 条目格式错 deny");
+check(denyOf({ target: { kind: "topic" }, added: ["- [2099-01-01] 未来条目"], removed: [] }), "hook: 规则 — 未来日期 deny");
+check(denyOf({ target: { kind: "topic" }, added: ["token = supersecret123"], removed: [] }), "hook: 规则 — 疑似凭据 deny");
+check(denyOf({ target: { kind: "topic" }, tool: "write", oldText: "- [2026-01-01] a\n- [2026-01-02] b", newText: "- [2026-01-01] a", added: [], removed: ["- [2026-01-02] b"] }), "hook: 规则 — 覆盖删历史条目 deny");
+const okRun = host.runWriteRules({ target: { kind: "topic" }, tool: "edit", oldText: "", newText: `- [${new Date().toISOString().slice(0, 10)}] 正常新条目`, added: [`- [${new Date().toISOString().slice(0, 10)}] 正常新条目`], removed: [] });
+check(okRun.decision === "allow", "hook: 规则 — 今天日期的正常追加 allow");
+
+// 外部命令钩子输出解析（与 dsh-hook-protocol 语义对齐）
+check(host.parseHookOutcome(2, "", "不许写").decision === "deny" && host.parseHookOutcome(2, "", "不许写").reason === "不许写", "hook: 外部 exit 2 → deny(stderr=原因)");
+check(host.parseHookOutcome(0, JSON.stringify({ decision: "deny", reason: "r" }), "").decision === "deny", "hook: 外部 JSON {decision} → deny");
+check(host.parseHookOutcome(0, JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: "why" } }), "").decision === "ask", "hook: 外部 claude-code 风格 → ask");
+check(host.parseHookOutcome(0, "plain text", "").decision === "allow", "hook: 外部普通 stdout → allow");
+check(host.parseHookOutcome(1, "", "boom").decision === "allow" && !!host.parseHookOutcome(1, "", "boom").note, "hook: 外部异常退出 → 放行 + note");
+
+check(host.bashTouchesMemory("echo x >> ~/.dsh/memory/topics/a.md") === true, "hook: bash 重定向写记忆命中");
+check(host.bashTouchesMemory("cat ~/.dsh/memory/topics/a.md") === false && host.bashTouchesMemory("ls ~/.dsh/memory") === false, "hook: bash 只读记忆不拦");
+
+// 端到端：writeGuardHook / postExecuteHook 挂载与决策
+check(typeof mountedHooks["tools/pre-execute"] === "function" && typeof mountedHooks["tools/post-execute"] === "function", "hook: pre/post-execute 已挂载");
+const NEXT_PASSED = Symbol("next");
+const passNext = async () => NEXT_PASSED;
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "write", arguments: { file_path: TOPIC, content: `- [${new Date().toISOString().slice(0, 10)}] ok\n` } }, passNext)) === NEXT_PASSED,
+  "hook: 正常写入 topics → 放行",
+);
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "write", arguments: { file_path: `${HOME}/.dsh/memory.md`, content: "- [2026-01-01] bad\n" } }, passNext)).kind === "deny",
+  "hook: 写 memory.md → deny",
+);
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "echo x >> ~/.dsh/memory/topics/a.md" } }, passNext)).kind === "ask",
+  "hook: bash 改记忆 → ask（转人工确认）",
+);
+store.writeGuard = "off";
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "write", arguments: { file_path: `${HOME}/.dsh/memory.md`, content: "- [2026-01-01] bad\n" } }, passNext)) === NEXT_PASSED,
+  "hook: writeGuard=off → 完全放行",
+);
+store.writeGuard = "rules";
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "write", arguments: { file_path: "/etc/hosts", content: "x" } }, passNext)) === NEXT_PASSED,
+  "hook: 记忆之外的写入不进入判定",
+);
+
+// 写入审计 + 读取提醒（post-execute）
+const writeExec = { name: "edit", arguments: { file_path: TOPIC, old_string: "", new_string: `- [${new Date().toISOString().slice(0, 10)}] 审计用条目\n` } };
+const postWrite = await mountedHooks["tools/post-execute"](writeExec, { content: [{ type: "text", text: "ok" }] }, async () => ({ kind: "accept" }));
+check(postWrite.additionalContexts?.[0]?.content?.[0]?.text.includes("已审计"), "hook: 写入落盘 → 附加审计提醒");
+check(existsSync(`${HOME}/.dsh/memory/audit.log`) && readFileSync(`${HOME}/.dsh/memory/audit.log`, "utf8").includes("post-write"), "hook: audit.log 落盘且记了 post-write");
+mkdirSync(join(HOME, ".dsh/memory/topics"), { recursive: true });
+writeFileSync(TOPIC, `# probe hook\n- [2026-01-01] probe hook fact\n`);
+const postRead = await mountedHooks["tools/post-execute"]({ name: "read", arguments: { file_path: TOPIC } }, { content: [] }, async () => ({ kind: "accept" }));
+check(postRead.additionalContexts?.[0]?.content?.[0]?.text.includes("read-hook") && postRead.additionalContexts[0].content[0].text.includes("1 条"), "hook: 读记忆文件 → 附加读取提醒（含条目数）");
+const postReadOther = await mountedHooks["tools/post-execute"]({ name: "read", arguments: { file_path: "/etc/hosts" } }, { content: [] }, async () => ({ kind: "accept" }));
+check(postReadOther.additionalContexts === undefined, "hook: 读记忆之外的文件不附加提醒");
+
+// 注入纪律块 + 注入过滤命令
+store.discipline = true;
+check(at(CWD).includes("记忆纪律") && at(CWD).includes("deny"), "hook: 注入层附加记忆纪律块");
+store.discipline = false;
+check(!at(CWD).includes("记忆纪律"), "hook: discipline=false 可关闭纪律块");
+store.discipline = true;
+const unfiltered = host.applyInjectFilter("keep\nSKIPME\nmore"); // 命令为空 → 原样
+store.injectHookCommand = "grep -v SKIPME";
+const filtered2 = host.applyInjectFilter("keep\nSKIPME\nmore");
+store.injectHookCommand = "";
+check(unfiltered.includes("SKIPME") && !filtered2.includes("SKIPME") && filtered2.includes("keep"), "hook: injectHookCommand 可过滤注入文本（空 = 原样）");
+check(at(CWD).includes("probe hook fact"), "hook: 过滤关闭后注入恢复原样");
+
+// 外部命令钩子真进程：writeGuard=full + 一条 deny 命令
+store.writeGuard = "full";
+store.writeHookCommand = "test \"$DSH_SKIP\" = 1 && exit 0 || exit 2";
+// 用一段 node 脚本当判定器：新增内容含 bad 就 exit 2
+store.writeHookCommand = `node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);process.exit(p.added.some(l=>l.includes("badword"))?2:0)})'`;
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "write", arguments: { file_path: TOPIC, content: "badword here\n" } }, passNext)).kind === "deny",
+  "hook: full 模式外部判定器 deny 生效（stdin payload 驱动）",
+);
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "write", arguments: { file_path: TOPIC, content: "# probe hook\n- [2026-01-01] probe hook fact\n- clean line\n" } }, passNext)) === NEXT_PASSED,
+  "hook: full 模式外部判定器放行干净写入",
+);
+store.writeGuard = "rules";
+store.writeHookCommand = "";
+
 console.log("dsh-memory probe — two-layer memory + rules, viewable & editable");
 console.log("─".repeat(72));
 for (const { ok, label } of results) console.log(`  ${ok ? "✅" : "❌"} ${label}`);

@@ -1,4 +1,5 @@
 import {
+  appendFileSync,
   chmodSync,
   copyFileSync,
   existsSync,
@@ -10,6 +11,8 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { execFile, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 // dsh-memory —— 两层长期记忆注入（全局 + 按项目）+ 全局规则文件，带开关，全部实时。
 //
@@ -40,6 +43,18 @@ import {
 // HTTP（host 半，供设置面板用；路径全部走白名单解析，越不出记忆目录与规则文件）：
 //   GET  /dsh-memory/content?target=global|rules|<slug>[&file=<名>][&format=text]
 //   POST /dsh-memory/write   { target, file, text }   需要头 x-dsh-memory: 1
+//
+// 钩子（v0.5.0 起，settings 的 dsh-memory 节可配）：
+//   writeGuard         "rules"(默认) = 内置规则引擎；"full" = 规则 + 外部命令；"off" = 不拦
+//   writeHookCommand   外部判定命令（writeGuard:"full" 时生效）：stdin 进 payload JSON，
+//                      exit 2 = deny（stderr 为原因）、exit 0 + stdout JSON {decision,reason}
+//                      （兼容 hookSpecificOutput.permissionDecision）—— 可接任意 LLM 脚本
+//                      做「这条值不值得记」的语义判断
+//   hookTimeoutMs      外部命令超时（默认 10000）
+//   readReminder       read 命中记忆文件时附加读取提醒（默认 true）
+//   discipline         注入层强制附加「记忆纪律」块（默认 true）
+//   injectHookCommand  注入文本的外部过滤命令（stdin 进、stdout 出；默认空 = 不过滤）
+//   audit              写入落盘后追加 ~/.dsh/memory/audit.log（JSONL，默认 true）
 
 const HOME = process.env.HOME ?? "";
 
@@ -96,6 +111,28 @@ const FILE_RE = /^[A-Za-z0-9\u4e00-\u9fff._ -]+\.md$/;
 export const name = "dsh-memory";
 export const inject = ["systemPrompt"];
 
+// 钩子子系统的纯函数与处理器：导出仅供 tests/probe.mjs 直测（host 半边自包含，无副作用）。
+export {
+  memoryTargetOf,
+  extractEntries,
+  validEntryDate,
+  lineDiff,
+  scanSecrets,
+  scanStale,
+  mergeDecisions,
+  runWriteRules,
+  parseHookOutcome,
+  runCommandHook,
+  buildWritePayload,
+  bashTouchesMemory,
+  writeGuardHook,
+  postExecuteHook,
+  applyInjectFilter,
+  contextMessage,
+  auditLog,
+  DISCIPLINE_BLOCK,
+};
+
 /**
  * 手写 schema：无需 schemastery 依赖（本插件位于 node_modules 之外，解析不到它）。
  * dsh-settings 只要求 schema 可调用，并在 describe 时能 toJSON()。
@@ -113,6 +150,14 @@ function MemorySettings(value) {
     knownProjects: [...known],
     maxChars,
     injectMode: v.injectMode === "full" ? "full" : "index",
+    // ── 钩子子系统 ──
+    writeGuard: v.writeGuard === "off" || v.writeGuard === "full" ? v.writeGuard : "rules",
+    writeHookCommand: typeof v.writeHookCommand === "string" ? v.writeHookCommand : "",
+    hookTimeoutMs: Number.isFinite(v.hookTimeoutMs) ? Math.max(1000, Math.floor(v.hookTimeoutMs)) : DEFAULT_HOOK_TIMEOUT_MS,
+    readReminder: v.readReminder !== false,
+    discipline: v.discipline !== false,
+    injectHookCommand: typeof v.injectHookCommand === "string" ? v.injectHookCommand : "",
+    audit: v.audit !== false,
   };
 }
 MemorySettings.toJSON = () => ({ type: "object", additionalProperties: true });
@@ -578,7 +623,10 @@ function compose(context) {
     }
   }
 
-  return blocks.join("\n\n---\n\n");
+  let body = blocks.join("\n\n---\n\n");
+  const values2 = scope?.get() ?? {};
+  if (body && values2.discipline !== false) body = `${body}\n\n${DISCIPLINE_BLOCK}`;
+  return applyInjectFilter(body);
 }
 
 // ══ 层解析：读与写的唯一入口 ══════════════════════════════════════════════════
@@ -735,7 +783,529 @@ function writeMemoryFile(path, text) {
   return { changed: true, bytes: Buffer.byteLength(text) };
 }
 
-// ══ HTTP 路由（设置面板的读写后端）═══════════════════════════════════════════
+// ══ 钩子子系统 ═══════════════════════════════════════════════════════════════
+// 「是否该写记忆 / 该不该读记忆」不再只靠提示词劝，而是挂进 DSH 原生工具管线
+// （@deepseek-ai/dsh-tools 的 tools/pre-execute / tools/post-execute waterfall，
+//   与官方 dsh-hooks-claude-code 桥用的是同一批事件）：
+//
+//   写入钩子  tools/pre-execute → write/edit/bash 命中记忆管辖路径时跑判定管线：
+//             内置规则引擎（确定性、零成本）+ 可选外部命令（writeGuard:"full"，
+//             stdin 进 payload JSON，exit 2 = deny、stdout JSON 出决策 —— 可接任意
+//             LLM 脚本做「这条值不值得记」的语义判断）。deny 的 reason 会成为该次
+//             工具调用的 Error 结果，模型当场看到为什么被拒、该怎么改。
+//   审计钩子  tools/post-execute → 写入落盘后追加 audit.log（JSONL），并校验落盘
+//             内容；条目格式有问题时附加提醒上下文让模型自修。
+//   读取钩子  ① 注入层强制附加「记忆纪律」块（compose）；② read 命中记忆文件时
+//             附加条目数/行号提醒（防凭索引编造）；③ 可选外部命令对注入文本做
+//             过滤/脱敏（injectHookCommand）。
+//
+// 外部命令的输出语义与官方 dsh-hook-protocol 对齐（exit 2 阻断、stdout JSON 决策、
+// 兼容 hookSpecificOutput.permissionDecision），但不 import 任何包 —— 本插件必须
+// 保持零依赖（link: 安装解析不到 profile 的 node_modules）。
+
+/** 受钩子管辖的记忆路径（绝对路径，前缀匹配）。 */
+const GUARDED_PATHS = [`${HOME}/.dsh/memory`, `${HOME}/.dsh/memory.md`, `${HOME}/.dsh/AGENTS.md`];
+
+/** 条目行：`- [YYYY-MM-DD] 事实`。 */
+const ENTRY_LINE_RE = /^\s*-\s*\[(\d{4}-\d{2}-\d{2})\]/;
+
+/** 项目层 MEMORY.md 的人写索引行：`- [标题](文件.md) — 摘要`。 */
+const INDEX_LINK_RE = /^\s*-\s*\[[^\]]+\]\([^)]+\.md\)/;
+
+/** 敏感信息模式（deny 依据）。reason 只报模式名与行号，不回显命中值。 */
+const SECRET_PATTERNS = [
+  ["api key (sk-…)", /sk-[A-Za-z0-9_-]{16,}/],
+  ["anthropic key (sk-ant-…)", /sk-ant-[A-Za-z0-9_-]{16,}/],
+  ["aws access key", /AKIA[0-9A-Z]{16}/],
+  ["github token (gh?_…)", /gh[pousr]_[A-Za-z0-9]{20,}/],
+  ["slack token (xox…)", /xox[baprs]-[A-Za-z0-9-]{10,}/],
+  ["private key block", /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ["bearer token", /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/],
+  ["credential assignment", /\b(api[_-]?key|secret|passwd|password|pwd|token)\b\s*[:=]\s*["']?[A-Za-z0-9+/_-]{12,}/i],
+];
+
+/** 过时陈述模式（allow + 审计 note：纪律要求记「现状」，变迁史会立刻变陈旧）。 */
+const STALE_RE = /(已卸载|已弃用|已删除|不再使用|不再维护|was uninstalled|is deprecated|no longer (used|maintained))/i;
+
+/** bash 里「会改文件」的模式：重定向、tee、sed -i。 */
+const BASH_MUTATE_RE = /(>>|>[^&|]|tee\b|sed\s+(?:[^|]*\s)?-i\b)/;
+
+/** 记忆路径字面量（bash command 里可能出现的形态）。 */
+const MEMORY_PATH_TOKENS = [`${HOME}/.dsh/memory`, `${HOME}/.dsh/memory.md`, "${HOME}/.dsh/memory", "~/.dsh/memory", "~/.dsh/AGENTS.md"];
+
+/** audit.log 的轮转阈值。 */
+const AUDIT_MAX_BYTES = 2 * 1024 * 1024;
+
+/** 外部钩子默认超时。 */
+const DEFAULT_HOOK_TIMEOUT_MS = 10_000;
+
+/**
+ * 判断路径是否落在钩子管辖范围内，并给出层归属。
+ * @param {string} path - 绝对路径。
+ * @returns {{kind:string, layer:string}|null} 层归属；null = 不归记忆钩子管。
+ */
+function memoryTargetOf(path) {
+  if (typeof path !== "string" || path.length === 0) return null;
+  if (path === `${HOME}/.dsh/memory.md`) return { kind: "global-single", layer: "global" };
+  if (path === `${HOME}/.dsh/AGENTS.md`) return { kind: "rules", layer: "rules" };
+  const root = `${HOME}/.dsh/memory`;
+  if (path !== root && !path.startsWith(`${root}/`)) return null;
+  const rel = path.slice(root.length + 1);
+  if (rel.startsWith("topics/")) return { kind: rel.endsWith(".md") ? "topic" : "plugin-internal", layer: "global" };
+  if (rel.startsWith("projects/")) {
+    const rest = rel.slice("projects/".length);
+    const slash = rest.indexOf("/");
+    if (slash === -1) return { kind: rest.endsWith(".md") ? "project-single" : "plugin-internal", layer: `project:${rest.replace(/\.md$/, "")}` };
+    const slug = rest.slice(0, slash);
+    const file = rest.slice(slash + 1);
+    if (file === "MEMORY.md") return { kind: "project-index", layer: `project:${slug}` };
+    if (file.endsWith(".md")) return { kind: "project-body", layer: `project:${slug}` };
+    return { kind: "plugin-internal", layer: `project:${slug}` };
+  }
+  if (rel === "audit.log" || rel.endsWith(".bak")) return { kind: "plugin-internal", layer: "global" };
+  return { kind: "other", layer: "global" };
+}
+
+/**
+ * 提取正文中的条目行（`- [YYYY-MM-DD] …`；项目索引层另认 `- [标题](x.md)`）。
+ * @param {string} text - 正文。
+ * @param {boolean} indexShape - 是否按人写索引的宽松格式认条目。
+ * @returns {{line:number,text:string,date:string|null}[]} 条目（行号 1 起）。
+ */
+function extractEntries(text, indexShape = false) {
+  return String(text)
+    .split("\n")
+    .map((t, i) => {
+      const m = ENTRY_LINE_RE.exec(t) ?? (indexShape ? INDEX_LINK_RE.exec(t) : null);
+      return m ? { line: i + 1, text: t.trim(), date: m[1] ?? null } : null;
+    })
+    .filter(Boolean);
+}
+
+/**
+ * 校验条目日期：合法且不晚于今天（防 2026-13-45 这类 Date roll-over，也防未来日期）。
+ * @param {string} s - YYYY-MM-DD。
+ * @returns {boolean} 是否可用。
+ */
+function validEntryDate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s ?? "");
+  if (!m) return false;
+  const d = new Date(`${s}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return false;
+  const ok =
+    d.getUTCFullYear() === Number(m[1]) && d.getUTCMonth() + 1 === Number(m[2]) && d.getUTCDate() === Number(m[3]);
+  if (!ok) return false;
+  const now = new Date();
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return d.getTime() <= today;
+}
+
+/**
+ * 行级差集：newText 有而 oldText 没有的行（按 new 顺序）。
+ * @param {string} oldText - 旧正文。
+ * @param {string} newText - 新正文。
+ * @returns {{added:string[],removed:string[]}} 差集。
+ */
+function lineDiff(oldText, newText) {
+  const oldSet = new Set(String(oldText).split("\n"));
+  const newSet = new Set(String(newText).split("\n"));
+  const added = String(newText).split("\n").filter((l) => !oldSet.has(l));
+  const removed = String(oldText).split("\n").filter((l) => !newSet.has(l));
+  return { added, removed };
+}
+
+/**
+ * 扫描敏感信息。
+ * @param {string} text - 正文。
+ * @returns {{line:number,pattern:string}[]} 命中（只报模式名，不回显值）。
+ */
+function scanSecrets(text) {
+  const hits = [];
+  String(text).split("\n").forEach((line, i) => {
+    for (const [pattern, re] of SECRET_PATTERNS) {
+      if (re.test(line)) hits.push({ line: i + 1, pattern });
+    }
+  });
+  return hits;
+}
+
+/**
+ * 扫描过时陈述。
+ * @param {string} text - 正文。
+ * @returns {{line:number}[]} 命中。
+ */
+function scanStale(text) {
+  return String(text)
+    .split("\n")
+    .map((line, i) => (STALE_RE.test(line) ? { line: i + 1 } : null))
+    .filter(Boolean);
+}
+
+/**
+ * 决策单调合并：deny > ask > allow（与官方 mergeHookOutputs 同序）。
+ * @param {object} a - {decision, reason?, notes?}。
+ * @param {object} b - 同上。
+ * @returns {object} 合并结果。
+ */
+function mergeDecisions(a, b) {
+  const rank = { deny: 3, ask: 2, allow: 1 };
+  const pick = (rankOf) => (rank[a?.decision] >= rankOf ? a : b);
+  const winner = pick(Math.max(rank[a?.decision] ?? 0, rank[b?.decision] ?? 0));
+  const notes = [...(a?.notes ?? []), ...(b?.notes ?? [])];
+  return {
+    decision: winner?.decision ?? "allow",
+    ...(winner?.reason ? { reason: winner.reason } : {}),
+    notes: notes.length > 0 ? notes : winner?.notes ?? [],
+  };
+}
+
+/**
+ * 内置规则引擎：对一次记忆写入给出决策。
+ * @param {object} p - payload（tool/path/target/layer/oldText/newText/added/removed/command）。
+ * @returns {{decision:string, reason?:string, notes:string[]}} 决策。
+ */
+function runWriteRules(p) {
+  const notes = [];
+  const deny = (reason) => ({ decision: "deny", reason, notes });
+
+  // 0) 插件内部资产（.bak / audit.log / 非 md）一律拒绝 —— 模型不该碰备份与审计。
+  if (p.target?.kind === "plugin-internal") {
+    return deny("dsh-memory write-guard：这是 dsh-memory 插件的内部文件（备份/审计），不要用工具修改它。");
+  }
+
+  // 1) memory.md 现在只是导航索引，正文条目必须去 topics/ 分片。
+  if (p.target?.kind === "global-single" && p.added?.some((l) => ENTRY_LINE_RE.test(l))) {
+    return deny(
+      "dsh-memory write-guard：memory.md 已改为纯导航索引，不要往里写记忆条目。" +
+        "请把条目追加到 ~/.dsh/memory/topics/ 下对应主题分片（每个主题一个 .md，按主题归类）。",
+    );
+  }
+
+  // 2) 新增条目的格式与日期。
+  const indexShape = p.target?.kind === "project-index";
+  const addedEntries = extractEntries((p.added ?? []).join("\n"), indexShape);
+  const looksLikeEntry = (p.added ?? []).some((l) => /^\s*-\s*\[/.test(l));
+  if (looksLikeEntry && addedEntries.length === 0) {
+    return deny(
+      indexShape
+        ? "dsh-memory write-guard：MEMORY.md 索引行格式应为 `- [标题](文件.md) — 摘要`。"
+        : "dsh-memory write-guard：记忆条目格式应为 `- [YYYY-MM-DD] 事实`（ISO 日期、未过期的今天以前），请修正后重写。",
+    );
+  }
+  for (const e of addedEntries) {
+    if (e.date && !validEntryDate(e.date)) {
+      return deny(`dsh-memory write-guard：第 ${e.line} 条新增条目日期 ${e.date} 非法（或在未来）。用今天的日期，格式 - [YYYY-MM-DD] 事实。`);
+    }
+  }
+
+  // 3) 敏感信息：绝对拒绝。reason 只报行号与模式名，不回显命中值。
+  const secrets = scanSecrets((p.added ?? []).join("\n"));
+  if (secrets.length > 0) {
+    const listed = secrets.slice(0, 4).map((s) => `L${s.line} ${s.pattern}`).join("；");
+    return deny(`dsh-memory write-guard：新增内容疑似包含凭据（${listed}）。记忆会随每次请求注入并离开本机，禁止写入任何密钥/token/密码；只允许写「凭据存放在哪里」这类指针。`);
+  }
+
+  // 4) 破坏性覆盖：write 整文件导致既有条目丢失。
+  const kind = p.target?.kind ?? "";
+  const oldEntries = extractEntries(p.oldText ?? "", indexShape);
+  const newEntries = extractEntries(p.newText ?? "", indexShape);
+  if (p.tool === "write" && oldEntries.length > 0 && newEntries.length < oldEntries.length) {
+    return deny(
+      `dsh-memory write-guard：这次整文件覆写会把既有 ${oldEntries.length} 条记忆删到 ${newEntries.length} 条。` +
+        "请改用追加（保留原内容）或用 edit 做精确修改；确实要清理过期条目时交给用户手动处理。",
+    );
+  }
+
+  // 5) 过时陈述 → 放行但记 note（纪律是「记现状」，写变迁史会立刻陈旧）。
+  for (const s of scanStale((p.added ?? []).join("\n"))) {
+    notes.push(`L${s.line} 含「已卸载/不再使用」式陈述：优先改写成现状（现在用什么），变迁史不进记忆。`);
+  }
+
+  // 6) 超长条目 → 放行但记 note。
+  for (const e of addedEntries) {
+    if (e.text.length > ENTRY_WARN_CHARS) notes.push(`L${e.line} 条目超长（${e.text.length} 字符），建议拆分或压缩。`);
+  }
+
+  return { decision: "allow", notes };
+}
+
+/**
+ * 解析外部钩子进程输出（与官方 dsh-hook-protocol 语义对齐）。
+ * @param {number|undefined} exitCode - 退出码（spawn 失败为 undefined）。
+ * @param {string} stdout - stdout。
+ * @param {string} stderr - stderr。
+ * @returns {{decision:string, reason?:string, note?:string}} 决策；故障一律放行（note 记审计）。
+ */
+function parseHookOutcome(exitCode, stdout, stderr) {
+  if (exitCode === 2) {
+    return { decision: "deny", reason: stderr.trim() || "blocked by dsh-memory write hook" };
+  }
+  if (exitCode === 0) {
+    const t = stdout.trim();
+    if (t.startsWith("{")) {
+      try {
+        const j = JSON.parse(t);
+        const d = j?.decision ?? j?.hookSpecificOutput?.permissionDecision;
+        const r = j?.reason ?? j?.hookSpecificOutput?.permissionDecisionReason;
+        if (d === "deny" || d === "block") return { decision: "deny", ...(r ? { reason: r } : {}) };
+        if (d === "ask") return { decision: "ask", ...(r ? { reason: r } : {}) };
+        if (d === "allow" || d === "approve") return { decision: "allow" };
+      } catch {
+        /* 非法 JSON 当作普通 stdout：放行 */
+      }
+    }
+    return { decision: "allow" };
+  }
+  return { decision: "allow", note: `hook exited ${exitCode ?? "?"}: ${(stderr || stdout).slice(0, 200)}` };
+}
+
+/**
+ * 跑一次外部命令钩子：stdin 传 payload JSON。
+ * @param {string} command - shell 命令（经 /bin/zsh -c 执行）。
+ * @param {object} payload - 判定输入。
+ * @param {number} timeoutMs - 超时。
+ * @returns {Promise<{decision:string, reason?:string, note?:string}>} 决策。
+ */
+function runCommandHook(command, payload, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = execFile("/bin/zsh", ["-c", command], { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      const code = error?.killed ? 124 : (error ? (typeof error.code === "number" ? error.code : 1) : 0);
+      resolve(parseHookOutcome(code, String(stdout ?? ""), String(stderr ?? "")));
+    });
+    child.on("error", () => {}); // 回调已收 error，这里只防 unhandled
+    child.stdin?.end(JSON.stringify(payload));
+  });
+}
+
+/**
+ * 往 audit.log 追加一条 JSONL（超限轮转一层）。
+ * @param {object} entry - 审计记录。
+ */
+function auditLog(entry) {
+  try {
+    const path = `${HOME}/.dsh/memory/audit.log`;
+    try {
+      if (existsSync(path) && statSync(path).size > AUDIT_MAX_BYTES) {
+        rmSync(`${path}.1`, { force: true });
+        renameSync(path, `${path}.1`);
+      }
+    } catch {
+      /* 轮转失败照写 */
+    }
+    appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+  } catch {
+    /* 审计失败绝不影响工具调用本身 */
+  }
+}
+
+/**
+ * 构造一条附加上下文消息（形状与官方 createUserMessage 产出同构）。
+ * @param {string} text - 正文。
+ * @returns {object} user 消息。
+ */
+function contextMessage(text) {
+  return { id: randomUUID(), role: "user", content: [{ type: "text", text }], source: "dsh-memory" };
+}
+
+/**
+ * 组装 write/edit 的判定 payload。
+ * @param {string} tool - 工具名（write|edit）。
+ * @param {object} args - 工具参数。
+ * @returns {{path:string,target:object,layer:string,payload:object}|null} null = 与记忆无关。
+ */
+function buildWritePayload(tool, args) {
+  const path = args?.file_path;
+  const hit = memoryTargetOf(path);
+  if (!hit) return null;
+  const oldText = existsSync(path) ? readOrEmpty(path) : "";
+  let newText = oldText;
+  if (tool === "write") newText = String(args?.content ?? "");
+  if (tool === "edit") newText = String(oldText).replace(String(args?.old_string ?? ""), String(args?.new_string ?? ""));
+  const { added, removed } = lineDiff(oldText, newText);
+  return {
+    path,
+    target: hit,
+    layer: hit.layer,
+    payload: {
+      hook: "dsh-memory/write-guard",
+      tool,
+      path,
+      target: hit.kind,
+      layer: hit.layer,
+      oldChars: oldText.length,
+      newChars: newText.length,
+      oldText,
+      newText,
+      added,
+      removed,
+    },
+  };
+}
+
+/**
+ * bash command 的保守启发式：命令里同时出现记忆路径与「会改文件」的模式 → 交人工确认。
+ * @param {string} command - bash 命令。
+ * @returns {boolean} 是否命中。
+ */
+function bashTouchesMemory(command) {
+  const cmd = String(command ?? "");
+  if (!BASH_MUTATE_RE.test(cmd)) return false;
+  return MEMORY_PATH_TOKENS.some((t) => cmd.includes(t));
+}
+
+/** 写入钩子的当前配置。 */
+function guardConfig() {
+  const v = scope?.get() ?? {};
+  const guard = v.writeGuard === "off" || v.writeGuard === "full" ? v.writeGuard : "rules";
+  return {
+    guard,
+    command: typeof v.writeHookCommand === "string" ? v.writeHookCommand : "",
+    timeoutMs: Number.isFinite(v.hookTimeoutMs) ? Math.max(1000, Math.floor(v.hookTimeoutMs)) : DEFAULT_HOOK_TIMEOUT_MS,
+  };
+}
+
+/**
+ * tools/pre-execute 处理器：记忆写入判定。
+ * @param {object} exec - 工具执行上下文（name/arguments/signal…）。
+ * @param {function} next - 下游（放行）。
+ * @returns {Promise<object>} 决策或 next() 的结果。
+ */
+async function writeGuardHook(exec, next) {
+  const cfg = guardConfig();
+  if (cfg.guard === "off") return next();
+
+  let decided = null;
+  let payloadRef = null;
+
+  if (exec.name === "write" || exec.name === "edit") {
+    const built = buildWritePayload(exec.name, exec.arguments);
+    if (built) {
+      payloadRef = built;
+      decided = runWriteRules({ ...built.payload, target: built.target });
+      if (cfg.guard === "full" && cfg.command) {
+        const ext = await runCommandHook(cfg.command, built.payload, cfg.timeoutMs);
+        decided = mergeDecisions(decided, ext);
+      }
+    }
+  } else if (exec.name === "bash" && bashTouchesMemory(exec.arguments?.command)) {
+    // shell 改记忆不做静态 diff 分析，保守转人工确认。
+    decided = {
+      decision: "ask",
+      reason: "dsh-memory write-guard：这条 shell 命令看起来会改动记忆文件（重定向/tee/sed -i）。请确认；能用 write/edit 工具时优先用工具 —— 会经过完整格式与敏感信息校验。",
+    };
+  }
+
+  if (!decided) return next();
+
+  const { target, layer, path } = payloadRef ?? {};
+  auditLog({
+    event: "pre-execute",
+    tool: exec.name,
+    path,
+    target: target?.kind,
+    layer,
+    decision: decided.decision,
+    ...(decided.reason ? { reason: decided.reason.slice(0, 500) } : {}),
+    ...(decided.notes?.length ? { notes: decided.notes } : {}),
+  });
+
+  if (decided.decision === "deny") return { kind: "deny", reason: decided.reason };
+  if (decided.decision === "ask") return { kind: "ask", ...(decided.reason ? { reason: decided.reason } : {}) };
+  return next();
+}
+
+/**
+ * tools/post-execute 处理器：写入审计 + 读取提醒。
+ * @param {object} exec - 工具执行上下文。
+ * @param {object} result - 工具结果。
+ * @param {function} next - 下游。
+ * @returns {Promise<object>} 处理后的结果。
+ */
+async function postExecuteHook(exec, result, next) {
+  const downstream = await next();
+  try {
+    const values = scope?.get() ?? {};
+
+    // ── 写入落盘：审计 + 落盘校验 ──────────────────────────────────────────
+    if ((exec.name === "write" || exec.name === "edit") && !result?.isError) {
+      const built = buildWritePayload(exec.name, exec.arguments);
+      if (built) {
+        auditLog({
+          event: "post-write",
+          tool: exec.name,
+          path: built.path,
+          target: built.target.kind,
+          layer: built.layer,
+          added: built.payload.added.length,
+          removed: built.payload.removed.length,
+        });
+        // 落盘内容再校一遍条目格式：有问题不回滚（写入已发生），附加提醒让模型自修。
+        const indexShape = built.target.kind === "project-index";
+        const bad = built.payload.added.filter(
+          (l) => /^\s*-\s*\[/.test(l) && extractEntries(l, indexShape).length === 0,
+        );
+        const notes = [];
+        if (bad.length > 0) {
+          notes.push(
+            `⚠️ dsh-memory 审计：刚写入的 ${bad.length} 行不符合条目格式（应为 \`- [YYYY-MM-DD] 事实\`${indexShape ? " 或 `- [标题](文件.md) — 摘要`" : ""}），请立即用 edit 修正，不要留着坏格式：\n${bad.map((l) => `  ${l.trim().slice(0, 120)}`).join("\n")}`,
+          );
+        }
+        if (values.audit !== false) notes.push(`📝 已审计：${built.path}（+${built.payload.added.length}/−${built.payload.removed.length} 行）→ ~/.dsh/memory/audit.log`);
+        if (notes.length > 0) {
+          return { ...downstream, additionalContexts: [contextMessage(notes.join("\n")), ...(downstream?.additionalContexts ?? [])] };
+        }
+      }
+    }
+
+    // ── 读取记忆文件：附加提醒（条目数 + 纪律） ──────────────────────────────
+    if (exec.name === "read" && !result?.isError && values.readReminder !== false) {
+      const hit = memoryTargetOf(exec.arguments?.file_path);
+      if (hit && (hit.kind === "topic" || hit.kind === "project-body" || hit.kind === "project-single" || hit.kind === "project-index" || hit.kind === "global-single")) {
+        const text = readOrEmpty(exec.arguments.file_path);
+        const entries = extractEntries(text, hit.kind === "project-index");
+        const remind =
+          `dsh-memory read-hook：你刚读取的是${hit.layer === "global" ? "全局" : "项目"}记忆（${hit.kind}，${entries.length} 条 / ${text.length} 字符）。` +
+          "引用其中事实时按行号精确定位；不要凭索引标题臆测未读到的内容；若发现某条已过时，直接修正该行（追加/改写要过写入钩子）而不是口头指出。";
+        return { ...downstream, additionalContexts: [contextMessage(remind), ...(downstream?.additionalContexts ?? [])] };
+      }
+    }
+  } catch {
+    /* 钩子自身故障绝不影响工具结果 */
+  }
+  return downstream;
+}
+
+/** 注入层强制附加的记忆纪律块。 */
+const DISCIPLINE_BLOCK = [
+  "<!-- 记忆纪律（dsh-memory 钩子强制执行，不只是建议）：",
+  "     · 写入前先判断值不值得记：只写可复用的事实/偏好/坑，不写过程叙述与可从仓库推导的内容",
+  "     · 条目格式 `- [YYYY-MM-DD] 事实`；全局层写 ~/.dsh/memory/topics/ 分片，项目层写对应文件并登记 MEMORY.md",
+  "     · 写入动作由钩子校验：格式错/含凭据/覆盖历史 → 直接拒绝（deny，原因会回到你面前）；可疑改动 → 转人工确认（ask）",
+  "     · 读取：按行号精确 read，禁止凭索引标题臆测内容；发现过时条目就地修正 -->",
+].join("\n");
+
+/**
+ * 对注入文本应用可选的外部过滤命令（同步；compose 的 text 是同步求值）。
+ * @param {string} text - 组装后的注入正文。
+ * @returns {string} 过滤结果；失败/空输出回落原文。
+ */
+function applyInjectFilter(text) {
+  const cmd = (scope?.get() ?? {}).injectHookCommand;
+  if (typeof cmd !== "string" || cmd.length === 0) return text;
+  try {
+    const r = spawnSync("/bin/zsh", ["-c", cmd], {
+      input: text,
+      timeout: DEFAULT_HOOK_TIMEOUT_MS,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    const out = r.status === 0 ? String(r.stdout ?? "") : "";
+    return out.length > 0 ? out : text;
+  } catch {
+    return text;
+  }
+}
+
+
 
 /**
  * 发 JSON 响应。
@@ -881,6 +1451,16 @@ export function apply(ctx) {
         text: compose,
       }),
     "dsh-memory: long-term memory section",
+  );
+
+  // 写入钩子 + 审计/读取钩子：挂进 DSH 原生工具管线（与官方 hooks 桥同一批事件）。
+  ctx.effect(
+    () => ctx.on("tools/pre-execute", writeGuardHook),
+    "dsh-memory: write-guard pre-execute hook",
+  );
+  ctx.effect(
+    () => ctx.on("tools/post-execute", postExecuteHook),
+    "dsh-memory: audit & read-reminder post-execute hook",
   );
 
   // 可选依赖：settings 服务缺席时开关退化为「全部开启」，注入照常工作。

@@ -173,6 +173,63 @@ dsh-memory:
     - --Users-me-code-repo--
 ```
 
+## 钩子（v0.5.0）
+
+「该不该写记忆 / 有没有好好读记忆」不再只靠提示词劝 —— 钩子直接挂在 DSH 原生工具管线
+（`tools/pre-execute` / `tools/post-execute`，与官方 `dsh-hooks-claude-code` 桥同一批事件）上，
+在**动作发生时**硬性判定：
+
+### 写入钩子（write-guard，`tools/pre-execute`）
+
+agent 用 `write` / `edit` 触碰记忆管辖路径（`~/.dsh/memory/**`、`~/.dsh/memory.md`、`~/.dsh/AGENTS.md`）时，
+先跑内置规则引擎，`deny` 的原因会成为这次工具调用的 Error 结果、直接回到模型面前：
+
+| 规则 | 判定 |
+|---|---|
+| 碰插件内部资产（`.bak` / `audit.log` / 记忆目录里的非 md） | deny |
+| 往 `memory.md`（现役纯导航索引）写正文条目 | deny + 指路 `topics/` |
+| 新条目格式不是 `- [YYYY-MM-DD] 事实`（或日期非法/在未来） | deny + 给出正确格式 |
+| 新增内容疑似凭据（sk- / AKIA / ghp_ / Bearer / password= 等 8 类） | deny（只报行号与模式名，不回显值） |
+| `write` 整文件覆写导致既有条目变少 | deny + 要求改追加/edit |
+| `bash` 重定向/tee/sed -i 改记忆文件 | ask（转人工确认） |
+| 过时陈述（「已卸载/不再使用」式）、单条超长 | allow + 审计 note |
+
+`writeGuard: "full"` 时在内置规则之上再跑一个**外部判定命令**（`writeHookCommand`）：
+stdin 收到完整 payload JSON（tool/path/layer/oldText/newText/added/removed…），
+exit 2 = 拒绝（stderr 为原因）、exit 0 + stdout JSON `{decision, reason}` 出决策
+（兼容 `hookSpecificOutput.permissionDecision`）—— 所以**「这条值不值得记」的语义判断可以接任意 LLM 脚本**，
+不再受提示词约束力上限的限制。决策合并取最严（deny > ask > allow），钩子故障放行不误伤。
+
+### 审计与读取钩子（`tools/post-execute`）
+
+- **写入审计**：每次记忆写入落盘后追加一行 JSONL 到 `~/.dsh/memory/audit.log`
+  （时间/工具/路径/增删行数/判定），超 2MB 自动轮转 `.1`；落盘内容再校验一遍，
+  条目格式有问题时附加提醒让模型立即自修。
+- **读取提醒**：`read` 命中记忆文件时附加一条上下文：条目数/字符数、按行号引用、
+  禁止凭索引臆测、发现过时就地修正。
+
+### 注入层约束（读取侧）
+
+- **记忆纪律块**：注入正文末尾强制附加一段「纪律」（值不值得记才写、格式、钩子会拒绝什么、按行号读）——
+  提示词约束还在，但背后有钩子兜底。
+- **注入过滤命令**（可选，`injectHookCommand`）：组装好的注入文本过一遍外部命令
+  （stdin 进、stdout 出，失败/空输出回落原文），可做脱敏或按需裁剪。
+
+### 开关
+
+设置 → 记忆 → 「写入 / 读取钩子」区块（或手改 `settings.yaml` 的 `dsh-memory` 节）：
+
+```yaml
+dsh-memory:
+  writeGuard: rules          # rules（默认，内置规则）| full（规则+外部命令）| off
+  writeHookCommand: ""       # writeGuard: full 时的外部判定命令
+  hookTimeoutMs: 10000       # 外部命令超时
+  discipline: true           # 注入层记忆纪律块
+  readReminder: true         # 读取记忆文件时的附加提醒
+  audit: true                # 写入审计 audit.log
+  injectHookCommand: ""      # 注入文本过滤命令（留空不过滤）
+```
+
 ## 工作原理
 
 ```js

@@ -64,6 +64,11 @@
           ".dm-chip-on{background:var(--dsw-alias-brand-primary);border-color:transparent;color:var(--dsw-alias-label-primary-foreground)}",
           ".dm-num{box-sizing:border-box;width:104px;font-size:11px;line-height:16px;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
           ".dm-num:focus{outline:none;box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}",
+          ".dm-cmd{box-sizing:border-box;width:100%;font-size:11px;line-height:16px;padding:5px 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}",
+          ".dm-cmd:focus{outline:none;box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}",
+          ".dm-hookrow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 0}",
+          ".dm-hookrow-label{font-size:12px;line-height:17px;color:var(--dsw-alias-label-primary)}",
+          ".dm-hookrow-sub{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}",
         ].join("");
 
         function ensureStyleSheet() {
@@ -97,6 +102,14 @@
                 // 必须带上：漏掉它会让面板永久回落到默认值，档位与输入框都不跟着设置走。
                 maxChars: Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : 24000,
                 injectMode: v.injectMode === "full" ? "full" : "index",
+                // 钩子子系统字段：同样必须进快照，否则设置里改了也会被这里洗回默认值。
+                writeGuard: v.writeGuard === "off" || v.writeGuard === "full" ? v.writeGuard : "rules",
+                writeHookCommand: typeof v.writeHookCommand === "string" ? v.writeHookCommand : "",
+                hookTimeoutMs: Number.isFinite(v.hookTimeoutMs) ? Math.max(1000, Math.floor(v.hookTimeoutMs)) : 10000,
+                readReminder: v.readReminder !== false,
+                discipline: v.discipline !== false,
+                injectHookCommand: typeof v.injectHookCommand === "string" ? v.injectHookCommand : "",
+                audit: v.audit !== false,
               },
               status: snap.status === "ready" || snap.status === "unavailable" ? snap.status : "loading",
               writable: !!snap.writable,
@@ -180,6 +193,13 @@
           var known = value.knownProjects || [];
           var maxCharsValue = Number.isFinite(value.maxChars) ? value.maxChars : 24000;
           var injectModeValue = value.injectMode === "full" ? "full" : "index";
+          // 钩子子系统（host 半归一化的同名字段；这里只读值渲染 UI）
+          var writeGuardValue = value.writeGuard === "off" || value.writeGuard === "full" ? value.writeGuard : "rules";
+          var disciplineValue = value.discipline !== false;
+          var readReminderValue = value.readReminder !== false;
+          var auditValue = value.audit !== false;
+          var writeHookCommandValue = typeof value.writeHookCommand === "string" ? value.writeHookCommand : "";
+          var injectHookCommandValue = typeof value.injectHookCommand === "string" ? value.injectHookCommand : "";
 
           var openPair = react.useState(null);
           var open = openPair[0];
@@ -587,6 +607,106 @@
                       },
                     }),
                   ),
+            ),
+            react.createElement("h3", { className: "dm-group-title" }, "写入 / 读取钩子"),
+            react.createElement(
+              "div",
+              { className: "dm-limit" },
+              react.createElement(
+                "p",
+                { className: "dm-limit-desc" },
+                "写入钩子挂在 DSH 工具管线上：agent 用 write/edit/bash 改记忆文件时先经钩子判定——" +
+                  "条目格式错、疑似凭据、覆盖历史、写错位置会被直接拒绝（原因回到模型面前），可疑改动转人工确认。" +
+                  "读取钩子在注入层强制附加记忆纪律，并在读取记忆文件时附加提醒。",
+              ),
+              react.createElement(
+                "div",
+                { className: "dm-chips" },
+                react.createElement("span", { className: "dm-limit-desc" }, "写入守卫"),
+                [["rules", "规则引擎（默认）"], ["full", "规则 + 外部命令"], ["off", "关闭"]].map(function (pair) {
+                  return react.createElement(
+                    "button",
+                    {
+                      key: pair[0],
+                      type: "button",
+                      className: writeGuardValue === pair[0] ? "dm-chip dm-chip-on" : "dm-chip",
+                      onClick: function () { return setting.set("writeGuard", pair[0]); },
+                    },
+                    pair[1],
+                  );
+                }),
+              ),
+              writeGuardValue !== "full"
+                ? null
+                : react.createElement(
+                    "div",
+                    { className: "dm-chips" },
+                    react.createElement("span", { className: "dm-limit-desc" }, "外部判定命令（stdin 进 payload JSON；exit 2 = 拒绝，stdout JSON {decision,reason} 出决策，可接任意 LLM 脚本）"),
+                    react.createElement("input", {
+                      type: "text",
+                      className: "dm-cmd",
+                      value: writeHookCommandValue,
+                      placeholder: "例如：node ~/bin/memory-judge.mjs",
+                      onChange: function (e) { return setting.set("writeHookCommand", e.target.value); },
+                    }),
+                  ),
+              react.createElement(
+                "div",
+                { className: "dm-hookrow" },
+                react.createElement(
+                  "div",
+                  null,
+                  react.createElement("div", { className: "dm-hookrow-label" }, "读取纪律块"),
+                  react.createElement("div", { className: "dm-hookrow-sub" }, "注入层末尾强制附加「记忆纪律」：值不值得记、条目格式、按行号读取、钩子会拒绝什么"),
+                ),
+                react.createElement(Toggle, {
+                  checked: disciplineValue,
+                  label: "读取纪律块",
+                  onToggle: function () { return setting.set("discipline", !disciplineValue); },
+                }),
+              ),
+              react.createElement(
+                "div",
+                { className: "dm-hookrow" },
+                react.createElement(
+                  "div",
+                  null,
+                  react.createElement("div", { className: "dm-hookrow-label" }, "读取提醒"),
+                  react.createElement("div", { className: "dm-hookrow-sub" }, "read 命中记忆文件时附加提醒：条目数/字符数、禁止凭索引臆测、过时就地修正"),
+                ),
+                react.createElement(Toggle, {
+                  checked: readReminderValue,
+                  label: "读取提醒",
+                  onToggle: function () { return setting.set("readReminder", !readReminderValue); },
+                }),
+              ),
+              react.createElement(
+                "div",
+                { className: "dm-hookrow" },
+                react.createElement(
+                  "div",
+                  null,
+                  react.createElement("div", { className: "dm-hookrow-label" }, "写入审计"),
+                  react.createElement("div", { className: "dm-hookrow-sub" }, "每次记忆写入落盘后记一行 JSONL 到 ~/.dsh/memory/audit.log（谁、何时、增删几行、判定结果）"),
+                ),
+                react.createElement(Toggle, {
+                  checked: auditValue,
+                  label: "写入审计",
+                  onToggle: function () { return setting.set("audit", !auditValue); },
+                }),
+              ),
+              react.createElement(
+                "div",
+                { className: "dm-chips" },
+                react.createElement("span", { className: "dm-limit-desc" }, "注入过滤命令（可选；stdin 进注入文本、stdout 出过滤结果，失败回落原文）"),
+                react.createElement("input", {
+                  type: "text",
+                  className: "dm-cmd",
+                  value: injectHookCommandValue,
+                  placeholder: "留空 = 不过滤",
+                  onChange: function (e) { return setting.set("injectHookCommand", e.target.value); },
+                }),
+              ),
             ),
             react.createElement(
               "p",
