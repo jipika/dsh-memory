@@ -56,6 +56,14 @@
           ".dm-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}",
           ".dm-thumb{display:block;width:16px;height:16px;border-radius:50%;background:var(--dsw-alias-label-primary-foreground);transition:transform 120ms ease}",
           ".dm-switch[aria-checked='true'] .dm-thumb{transform:translateX(16px)}",
+          ".dm-limit{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l3);border-radius:8px}",
+          ".dm-limit-desc{margin:0;font-size:11px;line-height:17px;color:var(--dsw-alias-label-tertiary)}",
+          ".dm-chips{display:flex;align-items:center;gap:6px;flex-wrap:wrap}",
+          ".dm-chip{font-size:11px;line-height:16px;padding:3px 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}",
+          ".dm-chip:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+          ".dm-chip-on{background:var(--dsw-alias-brand-primary);border-color:transparent;color:var(--dsw-alias-label-primary-foreground)}",
+          ".dm-num{box-sizing:border-box;width:104px;font-size:11px;line-height:16px;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}",
+          ".dm-num:focus{outline:none;box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}",
         ].join("");
 
         function ensureStyleSheet() {
@@ -86,6 +94,9 @@
                 globalEnabled: v.globalEnabled !== false,
                 projectEnabled: v.projectEnabled !== null && typeof v.projectEnabled === "object" ? v.projectEnabled : {},
                 knownProjects: Array.isArray(v.knownProjects) ? v.knownProjects : [],
+                // 必须带上：漏掉它会让面板永久回落到默认值，档位与输入框都不跟着设置走。
+                maxChars: Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : 24000,
+                injectMode: v.injectMode === "full" ? "full" : "index",
               },
               status: snap.status === "ready" || snap.status === "unavailable" ? snap.status : "loading",
               writable: !!snap.writable,
@@ -167,6 +178,8 @@
           var globalEnabled = value.globalEnabled !== false;
           var projectEnabled = value.projectEnabled || {};
           var known = value.knownProjects || [];
+          var maxCharsValue = Number.isFinite(value.maxChars) ? value.maxChars : 24000;
+          var injectModeValue = value.injectMode === "full" ? "full" : "index";
 
           var openPair = react.useState(null);
           var open = openPair[0];
@@ -312,6 +325,15 @@
                 )
               : null;
 
+            // 该层正文的体量与注入状态（未编辑也未保存时显示，让超预算一眼可见）
+            var charInfo = layer.status === "ready" && file.exists && file.injected
+              ? (function () {
+                  var n = (file.text || "").length;
+                  if (maxCharsValue <= 0) return n + " 字符 · 全量注入";
+                  if (n <= maxCharsValue) return n + " 字符 · 全量注入（上限 " + maxCharsValue + "）";
+                  return n + " 字符 · 上限 " + maxCharsValue + "，约 " + Math.round((maxCharsValue / n) * 100) + "% 注入，其余转为带行号索引";
+                })()
+              : "";
             var statusText = layer.status !== "ready"
               ? ""
               : saveState.status === "saving"
@@ -320,7 +342,7 @@
                   ? "未保存"
                   : saveState.text !== ""
                     ? saveState.text
-                    : file.exists ? "" : "该文件还不存在，保存即创建";
+                    : file.exists ? charInfo : "该文件还不存在，保存即创建";
             var tools = react.createElement(
               "div",
               { className: "dm-tools" },
@@ -508,6 +530,64 @@
             ),
             react.createElement("h3", { className: "dm-group-title" }, "项目层（按工作区）"),
             react.createElement("div", { className: "dm-group" }, projects),
+            react.createElement("h3", { className: "dm-group-title" }, "注入方式"),
+            react.createElement(
+              "div",
+              { className: "dm-limit" },
+              react.createElement(
+                "p",
+                { className: "dm-limit-desc" },
+                "索引模式（默认）：提示词里只放「片 · 条数 · 路径 · 条目标题与行号」，正文按需读取 —— 记忆再长，每轮注入开销也恒定。" +
+                  "全文注入：把每片正文整篇放进提示词（超预算时保头部 + 附溢出索引）。",
+              ),
+              react.createElement(
+                "div",
+                { className: "dm-chips" },
+                [["index", "索引模式（默认）"], ["full", "全文注入"]].map(function (pair) {
+                  return react.createElement(
+                    "button",
+                    {
+                      key: pair[0],
+                      type: "button",
+                      className: injectModeValue === pair[0] ? "dm-chip dm-chip-on" : "dm-chip",
+                      onClick: function () { return setting.set("injectMode", pair[0]); },
+                    },
+                    pair[1],
+                  );
+                }),
+              ),
+              injectModeValue === "index"
+                ? null
+                : react.createElement(
+                    "div",
+                    { className: "dm-chips" },
+                    react.createElement("span", { className: "dm-limit-desc" }, "字符预算"),
+                    [[24000, "24K"], [48000, "48K"], [96000, "96K"], [0, "不限制"]].map(function (pair) {
+                      return react.createElement(
+                        "button",
+                        {
+                          key: String(pair[0]),
+                          type: "button",
+                          className: maxCharsValue === pair[0] ? "dm-chip dm-chip-on" : "dm-chip",
+                          onClick: function () { return setting.set("maxChars", pair[0]); },
+                        },
+                        pair[1],
+                      );
+                    }),
+                    react.createElement("input", {
+                      type: "number",
+                      className: "dm-num",
+                      min: 0,
+                      step: 1000,
+                      value: String(maxCharsValue),
+                      title: "自定义上限（字符，0 = 不限制）",
+                      onChange: function (e) {
+                        var n = Number(e.target.value);
+                        if (Number.isFinite(n) && n >= 0) setting.set("maxChars", Math.floor(n));
+                      },
+                    }),
+                  ),
+            ),
             react.createElement(
               "p",
               { className: "dm-note" },

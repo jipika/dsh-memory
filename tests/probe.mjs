@@ -3,7 +3,7 @@
  * 查看→编辑→保存）。完全自包含 —— 在临时 HOME 里造记忆文件，不依赖任何真实项目数据。
  * 无需浏览器 / 网络 / API Key。
  */
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -102,7 +102,7 @@ check(sections[0].name === "dsh-memory:long-term", `host: 段名 dsh-memory:long
 check(typeof sections[0].text === "function", "host: text 是函数 → 每次组装重读（写完即生效）");
 check(at(CWD).includes("Global memory"), "host: 全局层注入");
 check(at(CWD).includes("probe project index entry"), "host: 项目层索引注入");
-check(at(CWD).includes("主题文件按需直接读"), "host: 附带主题文件目录提示");
+check(at(CWD).includes("索引模式") && at(CWD).includes("read path="), "host: 注入索引并给出读取指引（渐进式）");
 check(at(CWD).includes(SLUG), `host: 由 cwd 推出的 slug 正确 (${SLUG})`);
 check(store.knownProjects.includes(SLUG), "host: knownProjects 自动扫描同步");
 check(compose({}).includes("Global memory") && !compose({}).includes("probe project index entry"), "host: 无 agent 时只注入全局层");
@@ -114,6 +114,40 @@ store.projectEnabled = { [SLUG]: false };
 check(!at(CWD).includes("probe project index entry") && at(CWD).includes("Global memory"), "host: 关闭该项目后该项目不注入、全局层不受影响");
 store.projectEnabled = {};
 check(at(CWD).includes("probe project index entry"), "host: 重新开启后立即重新读取");
+
+writeFileSync(join(HOME, ".dsh/memory/projects", SLUG, "MEMORY.md"), "- Homebrew template uses {{staged_path}} as a cask placeholder\n");
+const neutralized = at(CWD);
+check(!neutralized.includes("{{staged_path}}"), "host: 注入前拆开 {{，避免 dsh-system-prompt 当未知变量抛错");
+check(neutralized.includes("{ {staged_path}}"), "host: 拆开后仍能读出 staged_path 占位");
+writeFileSync(join(HOME, ".dsh/memory/projects", SLUG, "MEMORY.md"), INDEX_TEXT);
+
+// ── 渐进式注入：索引模式（片名 / 行号 / 分片优先 / full 回退 / 溢出索引）──────
+check(at(CWD).includes("索引模式") && at(CWD).includes("read path="), "index: 注入的是索引并给出读取指引");
+check(at(CWD).includes("- [L2] probe global fact"), "index: 条目带全文行号（read offset 可直接定位）");
+check(at(CWD).includes("Global memory (1 条"), "index: 单文件模式的片名取文件 H1");
+
+const TOPICS = join(HOME, ".dsh/memory/topics");
+mkdirSync(TOPICS, { recursive: true });
+writeFileSync(join(TOPICS, "probe-shard.md"), "# 探针分片\n\n- [2026-02-02] shard entry alpha\n");
+const sharded = at(CWD);
+check(sharded.includes("## 探针分片 (1 条"), "index: 分片片名取该文件 H1");
+check(sharded.includes("probe-shard.md"), "index: 片路径写进索引");
+check(sharded.includes("shard entry alpha"), "index: 片内条目以标题行出现");
+check(!sharded.includes("probe global fact"), "index: 分片目录存在时不再回落读单文件 memory.md");
+
+store.injectMode = "full";
+check(at(CWD).includes("probe global fact") && !at(CWD).includes("探针分片"), "full: injectMode=full 时回到全文注入");
+store.injectMode = "index";
+
+store.maxChars = 20;
+store.injectMode = "full";
+const clamped = at(CWD);
+check(clamped.includes("未全量注入") && /read path="[^"]+"/.test(clamped), "clamp: 超预算时给带行号的溢出索引而非静默截断");
+store.maxChars = 24000;
+store.injectMode = "index";
+
+rmSync(join(TOPICS, "probe-shard.md"));
+check(!at(CWD).includes("探针分片"), "index: 分片删掉后回落单文件（两种形态都工作）");
 
 // ── 路由脚手架 ──────────────────────────────────────────────────────────────
 check(routes.length === 1 && routes[0].path === "/dsh-memory", "host: 注册内容/写入路由 /dsh-memory");
