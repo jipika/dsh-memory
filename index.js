@@ -1100,11 +1100,17 @@ function auditLog(entry) {
 
 /**
  * 构造一条附加上下文消息（形状与官方 createUserMessage 产出同构）。
+ *
+ * source 必须是会话格式 v4 的生产者对象 `{ kind }`（官方各内置前端都写作
+ * `{ kind: "<producer>" }`）。写成裸字符串（v3 时代的插件名写法）会被 v4 校验
+ * 拒绝：日志下次加载时整段报 "format v4 message requires a producer-owned source
+ * kind"，会话打不开。
+ *
  * @param {string} text - 正文。
  * @returns {object} user 消息。
  */
 function contextMessage(text) {
-  return { id: randomUUID(), role: "user", content: [{ type: "text", text }], source: "dsh-memory" };
+  return { id: randomUUID(), role: "user", content: [{ type: "text", text }], source: { kind: "dsh-memory" } };
 }
 
 /**
