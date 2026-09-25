@@ -14,7 +14,6 @@
 
         var react = require("react");
         var inject = ["slots"];
-        var NS = "dsh-memory";
 
         var STYLE_ID = "dsh-memory-style";
         var CSS = [
@@ -80,25 +79,36 @@
           document.head.appendChild(el);
         }
 
-        /** 设置状态源：settings scope 的实时镜像。 */
+        /** 设置状态源：host 的 /dsh-memory/settings 路由（面板唯一的读写通道）。 */
         function createSettingSource() {
-          var state = { value: {}, status: "loading", writable: false };
-          var bound;
+          var DEFAULT_VALUE = {
+            globalEnabled: true,
+            projectEnabled: {},
+            maxChars: 24000,
+            injectMode: "index",
+            writeGuard: "rules",
+            writeHookCommand: "",
+            hookTimeoutMs: 10000,
+            readReminder: true,
+            discipline: true,
+            injectHookCommand: "",
+            audit: true,
+          };
+          var state = { value: DEFAULT_VALUE, projects: [], status: "loading", writable: true };
           var listeners = new Set();
+          var pending = {};
+          var timer = 0;
           var publish = function (next) {
-            if (next.value === state.value && next.status === state.status && next.writable === state.writable) return;
             state = next;
             listeners.forEach(function (fn) { fn(); });
           };
-          var sync = function () {
-            if (bound === void 0) return;
-            var snap = bound.getSnapshot();
-            var v = snap && snap.value !== null && typeof snap.value === "object" ? snap.value : {};
-            publish({
+          /** host 归一化后的值 → 面板快照（字段缺失时补默认值）。 */
+          var fold = function (raw, projects) {
+            var v = raw !== null && typeof raw === "object" ? raw : {};
+            return {
               value: {
                 globalEnabled: v.globalEnabled !== false,
                 projectEnabled: v.projectEnabled !== null && typeof v.projectEnabled === "object" ? v.projectEnabled : {},
-                knownProjects: Array.isArray(v.knownProjects) ? v.knownProjects : [],
                 // 必须带上：漏掉它会让面板永久回落到默认值，档位与输入框都不跟着设置走。
                 maxChars: Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : 24000,
                 injectMode: v.injectMode === "full" ? "full" : "index",
@@ -111,21 +121,60 @@
                 injectHookCommand: typeof v.injectHookCommand === "string" ? v.injectHookCommand : "",
                 audit: v.audit !== false,
               },
-              status: snap.status === "ready" || snap.status === "unavailable" ? snap.status : "loading",
-              writable: !!snap.writable,
-            });
+              projects: Array.isArray(projects) ? projects : state.projects,
+              status: "ready",
+              writable: true,
+            };
+          };
+          var load = function () {
+            return fetch("/dsh-memory/settings", { headers: { accept: "application/json" } })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (!d || d.ok !== true) throw new Error("settings route refused");
+                publish(fold(d.value, d.projects));
+              })
+              .catch(function () {
+                publish({ value: state.value, projects: state.projects, status: "unavailable", writable: false });
+              });
+          };
+          /** 合并提交：命令串攒 400ms 一起发，免得每敲一键一个请求。 */
+          var flush = function () {
+            timer = 0;
+            var patch = pending;
+            pending = {};
+            if (Object.keys(patch).length === 0) return Promise.resolve();
+            return fetch("/dsh-memory/settings", {
+              method: "POST",
+              headers: { "content-type": "application/json", "x-dsh-memory": "1" },
+              body: JSON.stringify({ patch: patch }),
+            })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (!d || d.ok !== true) throw new Error("settings write refused");
+                publish(fold(d.value, d.projects));
+              })
+              .catch(function () { return load(); });
           };
           return {
             store: {
               subscribe: function (fn) { listeners.add(fn); return function () { listeners.delete(fn); }; },
               getSnapshot: function () { return state; },
             },
-            attach: function (next) { bound = next; sync(); return bound.subscribe(sync); },
+            load: load,
             set: function (field, value) {
-              if (bound === void 0) return Promise.resolve();
-              return Promise.resolve(bound.set(field, value)).then(sync, function () { sync(); });
+              // 乐观更新：开关立刻动，回包再校准。
+              var optimistic = Object.assign({}, state.value);
+              optimistic[field] = value;
+              publish({ value: optimistic, projects: state.projects, status: state.status, writable: state.writable });
+              pending[field] = value;
+              if (timer !== 0) clearTimeout(timer);
+              if (typeof value === "string") {
+                timer = setTimeout(flush, 400);
+                return Promise.resolve();
+              }
+              return flush();
             },
-            available: function () { return bound !== void 0; },
+            available: function () { return state.status !== "unavailable"; },
           };
         }
 
@@ -140,7 +189,7 @@
           var checked = props.checked;
           var locked = pending || !setting.available() || !snap.writable;
           var title = !setting.available()
-            ? "设置服务不可用，无法写入开关"
+            ? "设置路由不可用，无法写入开关"
             : !snap.writable
               ? "设置文档只读"
               : checked ? "点击关闭" : "点击开启";
@@ -187,10 +236,11 @@
          */
         function MemoryPane() {
           var snap = react.useSyncExternalStore(setting.store.subscribe, setting.store.getSnapshot, setting.store.getSnapshot);
+          react.useEffect(function () { setting.load(); }, []);
           var value = snap.value || {};
           var globalEnabled = value.globalEnabled !== false;
           var projectEnabled = value.projectEnabled || {};
-          var known = value.knownProjects || [];
+          var known = Array.isArray(snap.projects) ? snap.projects : [];
           var maxCharsValue = Number.isFinite(value.maxChars) ? value.maxChars : 24000;
           var injectModeValue = value.injectMode === "full" ? "full" : "index";
           // 钩子子系统（host 半归一化的同名字段；这里只读值渲染 UI）
@@ -725,14 +775,7 @@
               MemoryPane,
             ),
           );
-          ctx.inject(["settingsScope"], function (scopeCtx) {
-            var binder = scopeCtx.settingsScope;
-            if (binder === void 0 || typeof binder.bind !== "function") return;
-            scopeCtx.effect(function () {
-              // decode 直通：host 半用的是手写 schema，无需客户端再 rehydrate 校验。
-              return setting.attach(binder.bind({ namespace: NS, decode: function (v) { return v; } }));
-            }, "dsh-memory: settings scope");
-          });
+          // 开关值由 host 的 /dsh-memory/settings 路由提供，面板挂载时拉一次（见 MemoryPane 的 effect）。
         }
 
         exports.name = "dsh-memory";

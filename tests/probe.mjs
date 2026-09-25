@@ -37,6 +37,7 @@ globalThis.document = {
 function makeReact() {
   const hooks = new Map();
   let cursor = 0;
+  let mountedOnce = false; // useEffect(deps=[]) 的挂载语义：只在首次执行
   return {
     createElement: (type, props, ...children) => ({
       __el: true, type, props: props ?? {}, children: children.flat().filter((c) => c !== null && c !== undefined && c !== false),
@@ -48,7 +49,12 @@ function makeReact() {
       return [hooks.get(k), (v) => hooks.set(k, typeof v === "function" ? v(hooks.get(k)) : v)];
     },
     useRef: (init) => ({ current: init }),
-    useEffect: () => {},
+    // 面板挂载时拉一次 /dsh-memory/settings：真实 React 里 deps=[] 只在挂载跑，probe 同样只跑首次
+    useEffect: (fn) => {
+      if (mountedOnce) return;
+      mountedOnce = true;
+      try { fn(); } catch { /* noop */ }
+    },
     useMemo: (fn) => fn(),
     useCallback: (fn) => fn,
     useSyncExternalStore: (sub, get) => { try { sub(() => {}); } catch { /* noop */ } return get(); },
@@ -80,18 +86,35 @@ const host = await import("../index.js");
 const sections = [];
 const routes = [];
 const mountedHooks = {};
-const store = { globalEnabled: true, projectEnabled: {}, knownProjects: [] };
-const fakeScope = {
-  get: () => store,
-  update: (patch) => { Object.assign(store, patch); return Promise.resolve(); },
-  watch: () => () => {},
-};
+const store = new Proxy(
+  {
+    globalEnabled: true,
+    projectEnabled: {},
+    injectMode: "index",
+    maxChars: 24000,
+    writeGuard: "rules",
+    writeHookCommand: "",
+    hookTimeoutMs: 10000,
+    readReminder: true,
+    discipline: true,
+    injectHookCommand: "",
+    audit: true,
+  },
+  {
+    // 开关注落在 ~/.dsh/memory/settings.json；host 每次现读 → 复制真实语义
+    set(target, key, value) {
+      target[key] = value;
+      writeFileSync(join(HOME, ".dsh/memory/settings.json"), `${JSON.stringify(target)}\n`);
+      return true;
+    },
+  },
+);
+writeFileSync(join(HOME, ".dsh/memory/settings.json"), `${JSON.stringify(store)}\n`);
 host.apply({
   effect: (fn) => fn(),
   on: (event, handler) => { mountedHooks[event] = handler; return () => {}; },
   systemPrompt: { section: (s) => { sections.push(s); return () => {}; } },
   inject: (deps, cb) => {
-    if (deps.includes("settings")) cb({ settings: { register: () => fakeScope } });
     if (deps.includes("webServer")) cb({ webServer: { register: (r) => { routes.push(r); return () => {}; } } });
   },
 });
@@ -106,7 +129,7 @@ check(at(CWD).includes("Global memory"), "host: 全局层注入");
 check(at(CWD).includes("probe project index entry"), "host: 项目层索引注入");
 check(at(CWD).includes("索引模式") && at(CWD).includes("read path="), "host: 注入索引并给出读取指引（渐进式）");
 check(at(CWD).includes(SLUG), `host: 由 cwd 推出的 slug 正确 (${SLUG})`);
-check(store.knownProjects.includes(SLUG), "host: knownProjects 自动扫描同步");
+check(host.knownProjects().includes(SLUG), "host: knownProjects 扫盘（面板列项目用）");
 check(compose({}).includes("Global memory") && !compose({}).includes("probe project index entry"), "host: 无 agent 时只注入全局层");
 
 store.globalEnabled = false;
@@ -269,6 +292,36 @@ check(w6.code === 200 && readFileSync(join(HOME, ".dsh/AGENTS.md"), "utf8").incl
 
 const w7 = await writeTarget("rules", "settings.yaml", "hacked: true\n");
 check(w7.code === 400 && !existsSync(join(HOME, ".dsh/settings.yaml")), "write: 白名单外的文件写不进去（400 且未落盘）");
+
+// ── 设置路由（面板唯一的开关通道）──────────────────────────────────────────
+const settingsRead = await callRoute("/dsh-memory/settings");
+check(settingsRead.code === 200 && settingsRead.json?.ok === true, "settings: GET 返回 ok");
+check(settingsRead.json?.value?.injectMode === "index" && settingsRead.json?.value?.writeGuard === "rules", "settings: GET 返回归一化后的开关");
+check(Array.isArray(settingsRead.json?.projects) && settingsRead.json.projects.includes(SLUG), "settings: GET 带上已知项目（扫盘）");
+
+const settingsNoHeader = await callRoute("/dsh-memory/settings", {
+  method: "POST",
+  body: JSON.stringify({ patch: { audit: false } }),
+});
+check(settingsNoHeader.code === 403, "settings: 缺 x-dsh-memory 头 → 403（跨站简单请求带不上此头）");
+
+const settingsBadPatch = await callRoute("/dsh-memory/settings", {
+  method: "POST",
+  headers: { "x-dsh-memory": "1" },
+  body: JSON.stringify({ patch: 5 }),
+});
+check(settingsBadPatch.code === 400, "settings: patch 非对象 → 400");
+
+const settingsWrite = await callRoute("/dsh-memory/settings", {
+  method: "POST",
+  headers: { "x-dsh-memory": "1" },
+  body: JSON.stringify({ patch: { audit: false, maxChars: 1234 } }),
+});
+check(settingsWrite.json?.value?.audit === false && settingsWrite.json?.value?.maxChars === 1234, "settings: POST 写开关并回新值");
+check(host.readSettings().audit === false && host.readSettings().maxChars === 1234, "settings: 写完 host 立刻读到（不做缓存）");
+check(at(CWD).includes("记忆纪律"), "settings: 改开关后注入组装不受影响");
+store.audit = true;
+store.maxChars = 24000;
 const w8 = await writeTarget("global", "memory.md", "x", {});
 check(w8.code === 403, "write: 缺 x-dsh-memory 头 → 403（挡掉跨站简单请求）");
 const w9 = await callRoute("/dsh-memory/write", { method: "POST", headers: { "x-dsh-memory": "1" }, body: "{not json" });
@@ -305,6 +358,14 @@ globalThis.fetch = (url, init) => {
   if (String(url).startsWith("/dsh-memory/write")) {
     return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, changed: true }) });
   }
+  if (String(url).startsWith("/dsh-memory/settings")) {
+    if (init?.method === "POST") Object.assign(store, JSON.parse(init.body).patch);
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true, value: { ...store }, projects: [SLUG] }),
+    });
+  }
   return Promise.reject(new Error("unexpected fetch " + url));
 };
 
@@ -318,10 +379,6 @@ globalThis.window = {
       });
       clientExports.apply({
         slots: { inject: (_s, fn) => fn(), register: (o, C) => regs.push({ o, C }) },
-        inject: (deps, cb) => cb({
-          settingsScope: { bind: () => ({ getSnapshot: () => ({ status: "ready", value: store, writable: true }), subscribe: () => () => {}, set: () => Promise.resolve() }) },
-          effect: (fn) => fn(),
-        }),
         effect: (fn) => fn(),
       });
     },
@@ -338,6 +395,8 @@ check(styleTags.length >= 1, "client: 样式表已注入");
 check(/\.dm-editor\{/.test(styleTags[0].textContent), "client: 样式表含编辑器样式");
 
 let pane = render();
+await tick(); // 等面板挂载时那次 /dsh-memory/settings 拉取落地
+pane = render();
 const strings = [];
 collect(pane, (n) => { for (const c of n.children ?? []) if (typeof c === "string") strings.push(c); });
 check(strings.includes("记忆"), "client: 面板含标题「记忆」");
@@ -351,6 +410,27 @@ check(rows.length === 3, `client: 三行（规则 / 全局 / 1 个项目），�
 const switches = collect(pane, (n) => n.props?.role === "switch");
 check(switches.length === 5, `client: 每层一个开关 + 钩子区 3 个（纪律/读取提醒/审计），实际 ${switches.length}`);
 check(strings.includes("写入 / 读取钩子") && strings.includes("写入守卫"), "client: 面板含「写入 / 读取钩子」区块");
+
+// ── 面板开关：读走 GET、写走 POST，闭环到 settings.json ─────────────────────
+check(calls.some((c) => c.url === "/dsh-memory/settings"), "client: 面板挂载时拉取 /dsh-memory/settings");
+const settingsPosts = () => calls.filter((c) => c.url === "/dsh-memory/settings" && c.init?.method === "POST");
+const postsBefore = settingsPosts().length;
+switches[switches.length - 1].props.onClick({ stopPropagation() {} });
+await tick();
+check(settingsPosts().length === postsBefore + 1, "client: 点开关 → POST /dsh-memory/settings");
+const swPost = settingsPosts().pop();
+const swPatch = JSON.parse(swPost.init.body).patch;
+check(swPost.init.headers["x-dsh-memory"] === "1", "client: 开关请求带 x-dsh-memory 头");
+check(typeof swPatch === "object" && Object.keys(swPatch).length === 1, "client: 请求体是单字段 patch");
+check(host.readSettings()[Object.keys(swPatch)[0]] === swPatch[Object.keys(swPatch)[0]], "client: 开关改动落到 settings.json（host 立即可见）");
+// 还原成默认，后面的注入断言仍按默认开关走
+store.globalEnabled = true;
+store.projectEnabled = {};
+store.maxChars = 24000;
+store.injectMode = "index";
+store.discipline = true;
+store.readReminder = true;
+store.audit = true;
 check(strings.includes("规则引擎（默认）") && strings.includes("规则 + 外部命令"), "client: 写入守卫三态 chips 渲染");
 check(strings.includes("读取纪律块") && strings.includes("写入审计") && strings.includes("读取提醒"), "client: 钩子区三个开关行渲染");
 

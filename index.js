@@ -28,10 +28,9 @@ import { randomUUID } from "node:crypto";
 //            或 <slug>.md        ← 单文件形式（向后兼容）
 // 项目 slug 规则与 DSH 的会话目录一致：cwd 的 '/' → '-'，两端加 '--'。
 //
-// 开关（可在「设置 → 记忆」里改，也可手改 settings.yaml 的 dsh-memory 节）：
+// 开关存 ~/.dsh/memory/settings.json（面板改、手改文件都即刻生效；注入与钩子每次现读）：
 //   globalEnabled   布尔，默认 true   关掉则全局层不注入
 //   projectEnabled  字典 slug→布尔    关掉的项目不注入；再次开启即刻重新读取
-//   knownProjects   字符串数组        host 扫描目录自动维护，供设置面板列出项目
 //   maxChars        数字，默认 24000   每层注入的字符预算；0 = 不限制（全量注入）
 //
 // 超预算时的注入策略（见 clamp）：保头部 + 附**溢出条目索引**（带全文行号，可按行号
@@ -43,6 +42,8 @@ import { randomUUID } from "node:crypto";
 // HTTP（host 半，供设置面板用；路径全部走白名单解析，越不出记忆目录与规则文件）：
 //   GET  /dsh-memory/content?target=global|rules|<slug>[&file=<名>][&format=text]
 //   POST /dsh-memory/write   { target, file, text }   需要头 x-dsh-memory: 1
+//   GET  /dsh-memory/settings                          开关当前值 + 已知项目
+//   POST /dsh-memory/settings  { patch }               合并写开关，需要头 x-dsh-memory: 1
 //
 // 钩子（v0.5.0 起，settings 的 dsh-memory 节可配）：
 //   writeGuard         "rules"(默认) = 内置规则引擎；"full" = 规则 + 外部命令；"off" = 不拦
@@ -84,9 +85,6 @@ const RULES_DIR = `${HOME}/.dsh`;
 
 /** 可查看/编辑的全局规则文件（DSH 原生的全局指令文件就是 ~/.dsh/AGENTS.md）。 */
 const RULE_FILES = ["AGENTS.md"];
-
-/** settings namespace（设置面板与 host 共享的开关状态）。 */
-const NS = "dsh-memory";
 
 /** 单层注入上限。 */
 /** 每层注入的默认字符预算（设置里可改；0 = 不限制，全量注入）。 */
@@ -131,24 +129,35 @@ export {
   contextMessage,
   auditLog,
   DISCIPLINE_BLOCK,
+  normalizeSettings,
+  readSettings,
+  updateSettings,
+  knownProjects,
+  handleRoute,
 };
 
 /**
- * 手写 schema：无需 schemastery 依赖（本插件位于 node_modules 之外，解析不到它）。
- * dsh-settings 只要求 schema 可调用，并在 describe 时能 toJSON()。
- * @param {unknown} value - 合并 schema 默认值、组合 base 与用户层之后的候选值。
+ * 设置文件：与记忆正文同根，跟着 ~/.dsh/memory 一起备份、同步、迁移。
+ *
+ * 不挂 dsh 的 settings 服务：0.1.7 把插件设置面换成了 cordis Config 表单
+ * （`@deepseek-ai/dsh-settings` 只导出 SettingsForms，旧 register/scope 已不存在），
+ * 而插件自持一个小文件与宿主版本无关 —— 注入与钩子每次现读，改完立刻生效。
+ */
+const SETTINGS_PATH = `${HOME}/.dsh/memory/settings.json`;
+
+/**
+ * 归一化：任何形状的输入都折叠成合法设置（面板与钩子读到的都是这个形状）。
+ * @param {unknown} value - 磁盘上或面板提交的候选值。
  * @returns {object} 规范化后的设置值。
  */
-function MemorySettings(value) {
+function normalizeSettings(value) {
   const v = value !== null && typeof value === "object" ? value : {};
   const enabled = v.projectEnabled !== null && typeof v.projectEnabled === "object" ? v.projectEnabled : {};
-  const known = Array.isArray(v.knownProjects) ? v.knownProjects.filter((x) => typeof x === "string") : [];
-  const maxChars = Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : DEFAULT_MAX_CHARS;
+  const budget = Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : DEFAULT_MAX_CHARS;
   return {
     globalEnabled: v.globalEnabled !== false,
     projectEnabled: { ...enabled },
-    knownProjects: [...known],
-    maxChars,
+    maxChars: budget,
     injectMode: v.injectMode === "full" ? "full" : "index",
     // ── 钩子子系统 ──
     writeGuard: v.writeGuard === "off" || v.writeGuard === "full" ? v.writeGuard : "rules",
@@ -160,10 +169,43 @@ function MemorySettings(value) {
     audit: v.audit !== false,
   };
 }
-MemorySettings.toJSON = () => ({ type: "object", additionalProperties: true });
 
-/** 当前 settings scope（settings 服务缺席时保持 undefined）。 */
-let scope;
+/**
+ * 读设置；文件缺失或损坏一律回落默认值。
+ * 不做缓存：文件不到 1 KB，而「面板改完立刻生效」比省这一次读更值钱。
+ * @returns {object} 归一化设置。
+ */
+function readSettings() {
+  try {
+    return normalizeSettings(JSON.parse(readFileSync(SETTINGS_PATH, "utf8")));
+  } catch {
+    return normalizeSettings({});
+  }
+}
+
+/**
+ * 合并写设置（面板每改一项调一次）。
+ * @param {object} patch - 只含被改字段。
+ * @returns {object} 写入后的完整设置。
+ */
+function updateSettings(patch) {
+  const next = normalizeSettings({ ...readSettings(), ...(patch ?? {}) });
+  try {
+    mkdirSync(`${HOME}/.dsh/memory`, { recursive: true });
+    writeFileSync(SETTINGS_PATH, `${JSON.stringify(next, null, 2)}\n`);
+  } catch {
+    /* 写失败不回滚：下一次 readSettings 仍是旧值，面板会跟着回落 */
+  }
+  return readSettings();
+}
+
+/**
+ * 已知项目 slug（面板列项目用）。直接扫盘，不再维护第二份状态。
+ * @returns {string[]} 已排序的 slug。
+ */
+function knownProjects() {
+  return listProjectSlugs();
+}
 
 /**
  * 把工作目录编码成记忆 slug，规则与 DSH 的 `~/.dsh/sessions/<slug>` 一致。
@@ -193,8 +235,7 @@ function readOrEmpty(path) {
  * @returns {number} 0 表示不限制（全量注入）。
  */
 function maxChars() {
-  const n = (scope?.get() ?? {}).maxChars;
-  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : DEFAULT_MAX_CHARS;
+  return readSettings().maxChars;
 }
 
 /**
@@ -471,7 +512,7 @@ function renderIndexBudgeted(header, files) {
 
 /** 注入模式：`index`（默认，渐进式）或 `full`（整篇注入，超限走 clamp）。 */
 function injectMode() {
-  return (scope?.get() ?? {}).injectMode === "full" ? "full" : "index";
+  return readSettings().injectMode;
 }
 
 /**
@@ -541,28 +582,12 @@ function listProjectSlugs() {
 }
 
 /**
- * 把扫描结果同步进设置（只在变化时写，避免无谓的 settings 写入）。
- * @param {object} s - settings scope。
- */
-function syncKnownProjects(s) {
-  try {
-    const slugs = listProjectSlugs();
-    const current = s.get()?.knownProjects ?? [];
-    if (slugs.length !== current.length || slugs.some((x, i) => x !== current[i])) {
-      Promise.resolve(s.update({ knownProjects: slugs })).catch(() => {});
-    }
-  } catch {
-    /* 同步失败不影响注入 */
-  }
-}
-
-/**
  * 组装两层记忆正文，并遵守开关。
  * @param {object} context - 组装上下文（含 agent）。
  * @returns {string} 拼接后的正文，或空串。
  */
 function compose(context) {
-  const values = scope?.get() ?? {};
+  const values = readSettings();
   const index = injectMode() === "index";
   const blocks = [];
 
@@ -624,7 +649,7 @@ function compose(context) {
   }
 
   let body = blocks.join("\n\n---\n\n");
-  const values2 = scope?.get() ?? {};
+  const values2 = readSettings();
   if (body && values2.discipline !== false) body = `${body}\n\n${DISCIPLINE_BLOCK}`;
   return applyInjectFilter(body);
 }
@@ -1161,7 +1186,7 @@ function bashTouchesMemory(command) {
 
 /** 写入钩子的当前配置。 */
 function guardConfig() {
-  const v = scope?.get() ?? {};
+  const v = readSettings();
   const guard = v.writeGuard === "off" || v.writeGuard === "full" ? v.writeGuard : "rules";
   return {
     guard,
@@ -1230,7 +1255,7 @@ async function writeGuardHook(exec, next) {
 async function postExecuteHook(exec, result, next) {
   const downstream = await next();
   try {
-    const values = scope?.get() ?? {};
+    const values = readSettings();
 
     // ── 写入落盘：审计 + 落盘校验 ──────────────────────────────────────────
     if ((exec.name === "write" || exec.name === "edit") && !result?.isError) {
@@ -1296,7 +1321,7 @@ const DISCIPLINE_BLOCK = [
  * @returns {string} 过滤结果；失败/空输出回落原文。
  */
 function applyInjectFilter(text) {
-  const cmd = (scope?.get() ?? {}).injectHookCommand;
+  const cmd = readSettings().injectHookCommand;
   if (typeof cmd !== "string" || cmd.length === 0) return text;
   try {
     const r = spawnSync("/bin/zsh", ["-c", cmd], {
@@ -1423,7 +1448,34 @@ async function handleWrite(req, res) {
 }
 
 /**
- * 路由入口：`/dsh-memory/content` 与 `/dsh-memory/write`。
+ * 设置路由：`GET /dsh-memory/settings`（读开关 + 已知项目）、
+ * `POST /dsh-memory/settings`（体 `{patch}`，合并写）。
+ * 面板唯一的设置通道：写的是 ~/.dsh/memory/settings.json，host 侧每次现读。
+ * @param {import("node:http").IncomingMessage} req - 请求。
+ * @param {import("node:http").ServerResponse} res - 响应。
+ * @returns {Promise<void>} 完成即响应已发。
+ */
+async function handleSettings(req, res) {
+  const method = String(req.method ?? "GET").toUpperCase();
+  if (method === "GET") return sendJson(res, 200, { ok: true, value: readSettings(), projects: knownProjects() });
+  if (String(req.headers?.["x-dsh-memory"] ?? "") !== "1") {
+    return sendJson(res, 403, { ok: false, error: "missing x-dsh-memory header" });
+  }
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (error) {
+    return sendJson(res, 400, { ok: false, error: String(error?.message ?? error) });
+  }
+  const patch = payload?.patch;
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    return sendJson(res, 400, { ok: false, error: "patch must be an object" });
+  }
+  return sendJson(res, 200, { ok: true, value: updateSettings(patch), projects: knownProjects() });
+}
+
+/**
+ * 路由入口：`/dsh-memory/content`、`/dsh-memory/write` 与 `/dsh-memory/settings`。
  * @param {import("node:http").IncomingMessage} req - 请求。
  * @param {import("node:http").ServerResponse} res - 响应。
  * @returns {Promise<void>} 完成即响应已发。
@@ -1434,6 +1486,7 @@ async function handleRoute(req, res) {
     const method = String(req.method ?? "GET").toUpperCase();
 
     if (url.pathname === "/dsh-memory/content") return handleContent(req, res);
+    if (url.pathname === "/dsh-memory/settings") return await handleSettings(req, res);
     if (url.pathname === "/dsh-memory/write") {
       if (method !== "POST") return sendJson(res, 405, { ok: false, error: "use POST" });
       return await handleWrite(req, res);
@@ -1445,7 +1498,7 @@ async function handleRoute(req, res) {
 }
 
 /**
- * 挂载：提示词段 + 设置 namespace + 内容/写入路由。
+ * 挂载：提示词段 + 工具钩子 + 内容/写入/设置路由。
  * @param {object} ctx - cordis 插件上下文。
  */
 export function apply(ctx) {
@@ -1468,21 +1521,6 @@ export function apply(ctx) {
     () => ctx.on("tools/post-execute", postExecuteHook),
     "dsh-memory: audit & read-reminder post-execute hook",
   );
-
-  // 可选依赖：settings 服务缺席时开关退化为「全部开启」，注入照常工作。
-  ctx.inject(["settings"], (sctx) => {
-    ctx.effect(() => {
-      const registered = sctx.settings.register(NS, MemorySettings);
-      scope = registered;
-      syncKnownProjects(registered);
-      // 目录变化（新增项目记忆）时刷新 knownProjects，供设置面板列出。
-      const stop = registered.watch(() => syncKnownProjects(registered));
-      return () => {
-        stop?.();
-        scope = undefined;
-      };
-    }, `dsh-memory: settings namespace ${NS}`);
-  });
 
   // 读写路由：设置面板「查看 / 编辑记忆与全局规则」用。webServer 缺席时面板会提示读取失败。
   ctx.inject(["webServer"], (wctx) => {

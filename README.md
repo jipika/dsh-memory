@@ -162,15 +162,14 @@ Memory upkeep (long-term memory):
 - `AGENTS.md` 的生效时机（面板底部也写了）：它在每个新会话开头注入，改完对**新会话**生效。
 - 记忆两层是**每次提示词组装时实时重读**的：保存后下一条消息就带上新内容，不需要重启。
 - 关掉的那一层不再注入；再次开启**立即重新读取**文件。
-- 开关状态存在 `~/.dsh/settings.yaml` 的 `dsh-memory` 节：
+- 开关存在 `~/.dsh/memory/settings.json`（与记忆正文同根，面板改、手改文件都即刻生效）：
 
-```yaml
-dsh-memory:
-  globalEnabled: true
-  projectEnabled:
-    --Users-me-code-repo--: false   # 关掉这个项目的记忆
-  knownProjects:                     # host 自动维护，供面板列出
-    - --Users-me-code-repo--
+```json
+{
+  "globalEnabled": true,
+  "projectEnabled": { "--Users-me-code-repo--": false },
+  "maxChars": 24000
+}
 ```
 
 ## 钩子（v0.5.0）
@@ -217,17 +216,18 @@ exit 2 = 拒绝（stderr 为原因）、exit 0 + stdout JSON `{decision, reason}
 
 ### 开关
 
-设置 → 记忆 → 「写入 / 读取钩子」区块（或手改 `settings.yaml` 的 `dsh-memory` 节）：
+设置 → 记忆 → 「写入 / 读取钩子」区块（或手改 `~/.dsh/memory/settings.json`）：
 
-```yaml
-dsh-memory:
-  writeGuard: rules          # rules（默认，内置规则）| full（规则+外部命令）| off
-  writeHookCommand: ""       # writeGuard: full 时的外部判定命令
-  hookTimeoutMs: 10000       # 外部命令超时
-  discipline: true           # 注入层记忆纪律块
-  readReminder: true         # 读取记忆文件时的附加提醒
-  audit: true                # 写入审计 audit.log
-  injectHookCommand: ""      # 注入文本过滤命令（留空不过滤）
+```json
+{
+  "writeGuard": "rules",      // rules（默认，内置规则）| full（规则+外部命令）| off
+  "writeHookCommand": "",     // writeGuard: full 时的外部判定命令
+  "hookTimeoutMs": 10000,     // 外部命令超时
+  "discipline": true,         // 注入层记忆纪律块
+  "readReminder": true,       // 读取记忆文件时的附加提醒
+  "audit": true,              // 写入审计 audit.log
+  "injectHookCommand": ""     // 注入文本过滤命令（留空不过滤）
+}
 ```
 
 ## 工作原理
@@ -245,13 +245,15 @@ ctx.systemPrompt.section({
 
 插件同时注册：
 
-- 一个 settings namespace（`dsh-memory`）承载开关与自动维护的项目清单；
-  host 半用手写 schema —— 插件装在 `node_modules` 之外，解析不到 `schemastery`。
-- 两条 HTTP 路由（读写共用同一个白名单解析函数，越不出记忆目录与规则文件）：
+- 开关存在插件自持的 `~/.dsh/memory/settings.json`：注入与钩子**每次现读**，面板改完即刻生效，
+  也不经过会换代的宿主设置 API；已知项目清单由 host 直接扫盘，不落第二份状态。
+- 三条 HTTP 路由（读写共用同一个白名单解析函数，越不出记忆目录与规则文件）：
 
 ```http
 GET  /dsh-memory/content?target=global|rules|<slug>[&file=<名>][&format=text]
-POST /dsh-memory/write   { target, file, text }     # 需请求头 x-dsh-memory: 1
+POST /dsh-memory/write     { target, file, text }   # 需请求头 x-dsh-memory: 1
+GET  /dsh-memory/settings                            # 开关当前值 + 已知项目
+POST /dsh-memory/settings  { patch }                 # 合并写开关，需请求头 x-dsh-memory: 1
 ```
 
 `target` 只认 `global`（`~/.dsh/memory/topics/*.md`，无分片时回落 `~/.dsh/memory.md`）、
@@ -274,9 +276,11 @@ cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开
 
 ## 兼容性
 
-依赖 DSH 的以下既有 seam：`systemPrompt.section()`（函数式 text）、`settings.register()`、
-`webServer.register()`、client 的 `settings.section` 槽位与 `settingsScope.bind()`。
-在 DSH Desktop 2.0.13 / dsh core 0.1.5-rc.2 上验证通过。
+依赖 DSH 的四个 seam：`systemPrompt.section()`（函数式 text）、`webServer.register({kind:"prefix"})`、
+`tools/pre-execute` / `tools/post-execute`，以及 client 的 `settings.section` 槽位。
+开关走插件自持的 `settings.json` 与自己的路由，不经过宿主设置服务 —— 0.1.7 把 settings 换成
+cordis Config 表单那次换代不影响它。
+在 DSH 0.1.7-rc.2（Desktop 应用）上验证通过：`node tests/probe.mjs` 166 项全绿。
 
 ## License
 

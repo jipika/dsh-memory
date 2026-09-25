@@ -1,8 +1,8 @@
 {
   "name": "@jipika/dsh-memory",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
-  "description": "Progressive long-term memory for DSH: sharded markdown bodies under ~/.dsh/memory/topics/, with only a live-generated index (shard · count · path · per-entry line numbers) injected into the system prompt — so the prompt cost stays flat however large the memory grows. Two layers (global + per-project) plus the global rule files, viewable AND editable in DSH Settings, with per-layer switches and an index/full injection toggle. v0.5.0 adds enforcement hooks: a write guard on the native tool pipeline (format/secrets/history rules, optional external command judge, deny/ask with reasons fed back to the model), post-write audit log, a read reminder when memory files are read, a mandatory discipline block, and an optional injection filter command. Zero extra LLM cost, live re-read.",
+  "description": "Progressive long-term memory for DSH: sharded markdown bodies under ~/.dsh/memory/topics/, with only a live-generated index (shard · count · path · per-entry line numbers) injected into the system prompt — so the prompt cost stays flat however large the memory grows. Two layers (global + per-project) plus the global rule files, viewable AND editable in DSH Settings, with per-layer switches and an index/full injection toggle. v0.5.0 adds enforcement hooks: a write guard on the native tool pipeline (format/secrets/history rules, optional external command judge, deny/ask with reasons fed back to the model), post-write audit log, a read reminder when memory files are read, a mandatory discipline block, and an optional injection filter command. Zero extra LLM cost, live re-read. v0.5.1 keeps the switches in ~/.dsh/memory/settings.json — read live by the plugin and edited from the settings pane over the plugin's own route, independent of the host settings API.",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
