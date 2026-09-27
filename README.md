@@ -13,6 +13,10 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![DSH 1024Store](https://img.shields.io/badge/DSH%201024Store-listed-10B981)](https://deepseek1024.com/)
 
+> **拥有**：`~/.dsh/memory/**` 的读写、每轮提示词注入与索引生成；`tools/pre-execute` / `tools/post-execute` 上的记忆写入守卫与审计日志。
+> **冲突时**：与 `trinity-hooks`（`dsh-hooks-claude-code` 桥）同为 `tools/pre-execute` 监听者 —— 本插件只审记忆路径，两者互不翻案；与官方 compaction 无交集。
+> **回滚**：从 `dsh.profile.bundles` 去掉 `@jipika/dsh-memory` + 重启应用。
+
 ---
 
 ## 它解决什么
