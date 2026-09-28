@@ -74,8 +74,22 @@ const SHARD_WARN_CHARS = 12000;
 /** 单条记忆的「建议」字符上限（超过只标记，不处理）。 */
 const ENTRY_WARN_CHARS = 400;
 
-/** 注入索引的整体预算：超出后只保留片级统计，不再逐条列标题。 */
-const INDEX_BUDGET_CHARS = 9000;
+/**
+ * 注入索引的**默认**字符预算（设置项 `indexBudget` 可改；0 = 不限制）。
+ *
+ * 历史：该值原为硬编码 9000，是「10 片 / 90 条」时代的取值。分片长到 27 片 / 285 条后，
+ * 逐条索引需要约 1.5–2 万字符 → 整层被 [renderIndexBudgeted] 降级成「只列片名 + 条数」
+ * 的空目录，模型没有任何条目线索，于是不再主动 read 记忆（2026-09-28 实测确认）。
+ * 现在改为：预算内**按片配额**列最新 N 条，绝不整层退化成零线索。
+ */
+const DEFAULT_INDEX_BUDGET = 12000;
+
+/**
+ * 索引的收缩阶梯：预算装不下「全量逐条」时，逐档降低**每片最多列出的条目数**，
+ * 每片都从**最新**的条目往前取 —— 保证任何一档下每片都有线索，而不是整层归零。
+ * 最后两档 1 / 0 只是极端兜底（0 = 仅片级统计，与旧行为一致）。
+ */
+const INDEX_PER_SHARD_LADDER = [8, 5, 3, 2, 1, 0];
 
 /** 项目层记忆目录。 */
 const PROJECT_DIR = `${HOME}/.dsh/memory/projects`;
@@ -159,6 +173,8 @@ function normalizeSettings(value) {
     projectEnabled: { ...enabled },
     maxChars: budget,
     injectMode: v.injectMode === "full" ? "full" : "index",
+    // 索引模式自己的预算：与 maxChars（正文上限）解耦，面板上两个档位各自独立
+    indexBudget: Number.isFinite(v.indexBudget) ? Math.max(0, Math.floor(v.indexBudget)) : DEFAULT_INDEX_BUDGET,
     // ── 钩子子系统 ──
     writeGuard: v.writeGuard === "off" || v.writeGuard === "full" ? v.writeGuard : "rules",
     writeHookCommand: typeof v.writeHookCommand === "string" ? v.writeHookCommand : "",
@@ -236,6 +252,18 @@ function readOrEmpty(path) {
  */
 function maxChars() {
   return readSettings().maxChars;
+}
+
+/**
+ * 索引模式的字符预算（设置项 `indexBudget`；0 = 不限制 → 始终全量逐条列出）。
+ *
+ * 与 `maxChars` 的分工：`maxChars` 管**正文**（full 模式 / 项目层 clamp），
+ * `indexBudget` 管**索引**（index 模式每轮注入的那张表）。两者互不影响。
+ *
+ * @returns {number} 字符数。
+ */
+function indexBudget() {
+  return readSettings().indexBudget;
 }
 
 /**
@@ -461,24 +489,71 @@ function shardName(text, fallback) {
 }
 
 /**
- * 渲染一层的**注入索引**：片级统计 + 片内条目「标题 · 行号」。
+ * 片级**关键词**：本机每个分片首行就是一条路由注释 ——
+ * `<!-- 插件开发与发布 · 自研插件、客户端插件写法、hook 管线、发布 -->`。
+ * 片名（H1）只说明「这片叫什么」，`·` 之后那一半才说明「这片讲什么」，
+ * 是模型判断「该不该读这片」时最便宜的线索（对齐 Claude Skills 用 description
+ * 做自动加载决策的思路）。只认**第一行**且必须带 `·`，避免误取第二行的写入说明。
+ *
+ * @param {string} text - 该片正文。
+ * @param {string} name - 已解析出的片名（重复时丢弃关键词）。
+ * @returns {string} 关键词（无则空串）。
+ */
+function shardKeywords(text, name) {
+  const first = String(text).split("\n", 1)[0].trim();
+  const m = first.match(/^<!--\s*(.+?)\s*-->$/);
+  if (!m) return "";
+  // 两种写法都认：`片名 · 关键词…`（本机主流）与 `片名：关键词…`；都没有分隔符时整句当关键词
+  const parts = m[1]
+    .split(/·|：/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const rest = (parts.length > 1 ? parts.slice(1) : parts).join(" · ");
+  if (!rest || rest === name) return "";
+  return rest.length > 96 ? `${rest.slice(0, 96)}…` : rest;
+}
+
+/**
+ * 片内**最新条目日期**（`- [YYYY-MM-DD]` 的字典序最大值 = 时间最晚）。
+ * 让模型一眼看出这片是「还在更新的活片」还是「陈年归档」——
+ * 新近度是本机记忆里最可靠的排序信号（也是 mem0/Letta 那类系统的默认衰减轴）。
+ *
+ * @param {string} text - 该片正文。
+ * @returns {string} `YYYY-MM-DD` 或空串。
+ */
+function latestEntryDate(text) {
+  const dates = [...String(text).matchAll(/^\s*-\s*\[(\d{4}-\d{2}-\d{2})\]/gm)].map((m) => m[1]).sort();
+  return dates.length > 0 ? dates[dates.length - 1] : "";
+}
+
+/**
+ * 渲染一层的**注入索引**：片级统计（片名 · 条数 · 体量 · 最新日期 · 关键词）+ 片内条目「标题 · 行号」。
  *
  * @param {string} header - 层名（写进注释头）。
  * @param {{name:string,path:string}[]} files - 该层文件。
- * @param {boolean} detail - 是否逐条列标题（预算不足时只列片级统计）。
+ * @param {number} [perShard] - 每片最多列出的条目数（**从最新的往前取**）；Infinity = 全列，0 = 只列片级统计。
  * @returns {string} 索引正文（无内容时为空串）。
  */
-function renderIndex(header, files, detail) {
+function renderIndex(header, files, perShard = Infinity) {
   const shards = [];
   for (const f of files) {
     const text = readOrEmpty(f.path).trim();
     if (!text) continue;
-    shards.push({ name: shardName(text, f.name), path: f.path, text, entries: parseEntries(text) });
+    const name = shardName(text, f.name);
+    shards.push({
+      name,
+      keywords: shardKeywords(text, name),
+      latest: latestEntryDate(text),
+      path: f.path,
+      text,
+      entries: parseEntries(text),
+    });
   }
   if (shards.length === 0) return "";
 
   const total = shards.reduce((n, s) => n + s.entries.length, 0);
   const chars = shards.reduce((n, s) => n + s.text.length, 0);
+  const quota = perShard <= 0 ? 0 : Number.isFinite(perShard) ? Math.floor(perShard) : Infinity;
   const out = [
     `<!-- ${header} · 索引模式：${shards.length} 片 / ${total} 条 / ${chars} 字符。`,
     "     正文不在提示词里 —— 需要细节时按下面的路径读取（offset 就是条目行号）：",
@@ -486,28 +561,88 @@ function renderIndex(header, files, detail) {
   ];
   for (const s of shards) {
     const over = s.text.length > SHARD_WARN_CHARS ? ` ⚠️超建议${SHARD_WARN_CHARS}` : "";
-    out.push("", `## ${s.name} (${s.entries.length} 条 · ${(s.text.length / 1000).toFixed(1)}k${over}) → ${s.path}`);
-    if (detail) {
-      for (const e of s.entries) {
-        out.push(`- [L${e.line}] ${e.title}${e.len > ENTRY_WARN_CHARS ? " ·长" : ""}`);
-      }
-    } else {
-      out.push(`- （${s.entries.length} 条；索引预算已满，未逐条列出，直接按路径读取）`);
+    const fresh = s.latest ? ` · 最新 ${s.latest}` : "";
+    out.push("", `## ${s.name} (${s.entries.length} 条 · ${(s.text.length / 1000).toFixed(1)}k${fresh}${over}) → ${s.path}`);
+    if (s.keywords) out.push(`   关键词：${s.keywords}`);
+    const listed =
+      quota === Infinity ? s.entries : quota <= 0 ? [] : s.entries.slice(Math.max(0, s.entries.length - quota));
+    for (const e of listed) {
+      out.push(`- [L${e.line}] ${e.title}${e.len > ENTRY_WARN_CHARS ? " ·长" : ""}`);
+    }
+    const hidden = s.entries.length - listed.length;
+    if (listed.length === 0) {
+      if (s.entries.length > 0) out.push(`- （${s.entries.length} 条；索引预算已满，未逐条列出，直接按路径读取）`);
+    } else if (hidden > 0) {
+      const lastHidden = s.entries[hidden - 1].line;
+      out.push(`- （上面只列最新 ${listed.length} 条；更早的 ${hidden} 条在同文件第 ${s.entries[0].line}–${lastHidden} 行）`);
     }
   }
   return out.join("\n");
 }
 
 /**
- * 带预算的索引渲染：超预算就退化为「只列片级统计」。
+ * 带预算的索引渲染：**绝不整层归零**。
+ *
+ * 旧行为是「超预算 → 整层退化为只列片级统计」。实测（2026-09-28，27 片 / 285 条 / 198k 字符）：
+ * 逐条索引约需 1.5–2 万字符 > 硬编码预算 9000 → 每片只剩一行「N 条；索引预算已满」，
+ * 模型拿不到任何条目标题，也就没有理由去 read —— 表现就是「插件明明在注入，却不读记忆」。
+ * 现在改为沿 [INDEX_PER_SHARD_LADDER] 逐档收缩「每片最新 N 条」：预算越紧，每片列得越少，
+ * 但**每片都保留线索**（含关键词与最新日期），只有极端情况才落到 0（仅统计）。
+ *
  * @param {string} header - 层名。
  * @param {{name:string,path:string}[]} files - 该层文件。
  * @returns {string} 索引正文。
  */
 function renderIndexBudgeted(header, files) {
-  const full = renderIndex(header, files, true);
-  if (full.length <= INDEX_BUDGET_CHARS) return full;
-  return renderIndex(header, files, false);
+  const budget = indexBudget();
+  const full = renderIndex(header, files);
+  if (budget <= 0 || full.length <= budget) return full;
+  for (const perShard of INDEX_PER_SHARD_LADDER) {
+    const text = renderIndex(header, files, perShard);
+    if (text.length <= budget) return text;
+  }
+  return renderIndex(header, files, 0);
+}
+
+/**
+ * full 模式（`injectMode: "full"`）的注入正文。
+ *
+ * 修 bug（2026-09-28）：旧实现在**全局层**直读 `~/.dsh/memory.md`，但该文件在分片迁移后
+ * 只剩一张导航表（965 字符 / 0 条目，且表格随分片漂移、已经过时）—— 切到「全文注入」
+ * 反而比索引模式**少**一大截记忆，与面板文案「把每片正文整篇放进提示词」不符。
+ * 现在全局层与项目层一样走分片：
+ *   · 单文件回落 → 交给 clamp（保头部 + 溢出条目索引，与旧行为一致）
+ *   · 分片且总量 ≤ 预算 → 逐片整篇注入
+ *   · 分片且总量 > 预算 → 自动回退索引模式，并在头注释里说明原因
+ *     （分片规模下「全文注入」必然超预算；硬塞只会把每片都切成碎片，不如给一张带行号的索引）
+ *
+ * @param {string} header - 层名（写进注释头）。
+ * @param {{name:string,path:string}[]} files - 该层文件。
+ * @returns {string} 注入正文（无内容时为空串）。
+ */
+function renderShardFull(header, files) {
+  const shards = [];
+  for (const f of files) {
+    const text = readOrEmpty(f.path).trim();
+    if (text) shards.push({ name: shardName(text, f.name), path: f.path, text });
+  }
+  if (shards.length === 0) return "";
+  if (shards.length === 1) {
+    return `<!-- ${header} · ${shards[0].path} -->\n\n${clamp(shards[0].text, shards[0].path)}`;
+  }
+  const chars = shards.reduce((n, s) => n + s.text.length, 0);
+  const budget = maxChars();
+  if (budget > 0 && chars > budget) {
+    return (
+      `<!-- ${header} · 你选了全文注入，但 ${shards.length} 片共 ${chars} 字符 > 上限 ${budget}` +
+      ` → 自动回退索引模式（要强制全文请把「正文上限」设为 0 = 不限制） -->\n\n${renderIndexBudgeted(header, files)}`
+    );
+  }
+  const out = [
+    `<!-- ${header} · 全文注入：${shards.length} 片 / ${chars} 字符${budget > 0 ? ` · 上限 ${budget}` : " · 不限制"} -->`,
+  ];
+  for (const s of shards) out.push("", `## ${s.name} → ${s.path}`, "", s.text);
+  return out.join("\n");
 }
 
 /** 注入模式：`index`（默认，渐进式）或 `full`（整篇注入，超限走 clamp）。 */
@@ -604,8 +739,9 @@ function compose(context) {
         );
       }
     } else {
-      const text = readOrEmpty(GLOBAL_MEMORY).trim();
-      if (text) blocks.push(`<!-- 全局记忆 · ${GLOBAL_MEMORY} -->\n\n${neutralizePromptVars(clamp(text, GLOBAL_MEMORY))}`);
+      // full 模式：走分片正文（而不是已废弃的 memory.md 导航索引）——见 renderShardFull
+      const body = renderShardFull(`全局记忆 · ${HOME}/.dsh/memory`, layerFiles(TOPICS_DIR, GLOBAL_MEMORY));
+      if (body) blocks.push(neutralizePromptVars(body));
     }
   }
 
@@ -1309,10 +1445,12 @@ async function postExecuteHook(exec, result, next) {
 /** 注入层强制附加的记忆纪律块。 */
 const DISCIPLINE_BLOCK = [
   "<!-- 记忆纪律（dsh-memory 钩子强制执行，不只是建议）：",
-  "     · 写入前先判断值不值得记：只写可复用的事实/偏好/坑，不写过程叙述与可从仓库推导的内容",
-  "     · 条目格式 `- [YYYY-MM-DD] 事实`；全局层写 ~/.dsh/memory/topics/ 分片，项目层写对应文件并登记 MEMORY.md",
-  "     · 写入动作由钩子校验：格式错/含凭据/覆盖历史 → 直接拒绝（deny，原因会回到你面前）；可疑改动 → 转人工确认（ask）",
-  "     · 读取：按行号精确 read，禁止凭索引标题臆测内容；发现过时条目就地修正 -->",
+  "     · 【开工先查】非琐碎任务开头先扫上面的索引：用任务里的关键词（框架/工具/文件名/报错码/用户原话里的名词）去匹配片名与「关键词」行，命中就 read 该片对应行号再动手；没命中就不读，别整库通读",
+  "     · 【读法】按行号精确 read（offset = 条目行号），禁止凭片名或标题臆测内容；某片只列了最新几条时，按提示的行号区间读更早的条目",
+  "     · 【写入判据】值得记：可复用的结论、用户偏好、坑与成因；不值得记：过程叙述、能从仓库或 git 推导的内容、一次性中间状态",
+  "     · 条目格式 `- [YYYY-MM-DD] 事实`；全局层写 ~/.dsh/memory/topics/ 分片（**新片首行写 `<!-- 片名 · 关键词… -->`**，关键词会进索引供路由），项目层写对应文件并登记 MEMORY.md；某片出现 ⚠️超建议 时按子主题就地拆片",
+  "     · 同一事实有了新结论就**就地改写那一行**（不追加第二条、不写「已改为」的变迁史）；发现过时条目就地修正",
+  "     · 写入动作由钩子校验：格式错/含凭据/覆盖历史 → 直接拒绝（deny，原因会回到你面前）；可疑改动 → 转人工确认（ask） -->",
 ].join("\n");
 
 /**

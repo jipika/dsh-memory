@@ -92,6 +92,7 @@ const store = new Proxy(
     projectEnabled: {},
     injectMode: "index",
     maxChars: 24000,
+    indexBudget: 12000,
     writeGuard: "rules",
     writeHookCommand: "",
     hookTimeoutMs: 10000,
@@ -161,17 +162,55 @@ check(sharded.includes("shard entry alpha"), "index: 片内条目以标题行出
 check(!sharded.includes("probe global fact"), "index: 分片目录存在时不再回落读单文件 memory.md");
 
 store.injectMode = "full";
-check(at(CWD).includes("probe global fact") && !at(CWD).includes("探针分片"), "full: injectMode=full 时回到全文注入");
+check(
+  at(CWD).includes("探针分片") && !at(CWD).includes("probe global fact"),
+  "full: injectMode=full 时注入分片正文（不再读已废弃的 memory.md 导航索引）",
+);
 store.injectMode = "index";
 
+// ── 索引预算：按片配额收缩，绝不整层退化为零标题（2026-09-28 修）──────────────
+const probeShard = (name, n) => {
+  const rows = [`<!-- ${name} · 探针关键词甲、探针关键词乙 -->`, "", `# ${name}`, ""];
+  for (let i = 1; i <= n; i += 1) {
+    const d = new Date(Date.UTC(2026, 0, i)).toISOString().slice(0, 10);
+    rows.push(`- [${d}] **${name} 条目 ${String(i).padStart(2, "0")}**（探针占位细节）`);
+  }
+  return `${rows.join("\n")}\n`;
+};
+writeFileSync(join(TOPICS, "probe-shard-2.md"), probeShard("探针分片二", 40));
+writeFileSync(join(TOPICS, "probe-shard-3.md"), probeShard("探针分片三", 40));
+store.injectMode = "full";
+check(at(CWD).includes("全文注入：3 片"), "full: 多片且总量在预算内 → 逐片整篇注入（头注释标明片数）");
+store.maxChars = 1200;
+check(at(CWD).includes("自动回退索引模式"), "full: 分片总量超上限 → 自动回退索引并说明原因");
+store.maxChars = 24000;
+store.injectMode = "index";
+store.indexBudget = 1200;
+const tight = at(CWD);
+check(tight.includes("关键词：探针关键词甲"), "budget: 片级关键词（首行注释 · 之后那段）进入索引");
+check(tight.includes("· 最新 2026-02-09"), "budget: 片级最新条目日期进入索引（新近度可见）");
+check(!tight.includes("未逐条列出"), "budget: 超预算时不再整层退化成「零标题」目录");
+check(
+  /上面只列最新 \d+ 条；更早的 \d+ 条在同文件第 \d+–\d+ 行/.test(tight),
+  "budget: 超预算按「每片最新 N 条」配额收缩并给出行号区间",
+);
+store.indexBudget = 0;
+check(
+  at(CWD).includes("探针分片二 条目 01") && at(CWD).includes("探针分片二 条目 40"),
+  "budget: 0 = 不限制 → 全量逐条",
+);
+store.indexBudget = 12000;
+rmSync(join(TOPICS, "probe-shard-2.md"));
+rmSync(join(TOPICS, "probe-shard-3.md"));
+
+// clamp 只作用于「单文件回落」形态：先移走分片，让它回落到 memory.md
+rmSync(join(TOPICS, "probe-shard.md"));
 store.maxChars = 20;
 store.injectMode = "full";
 const clamped = at(CWD);
-check(clamped.includes("未全量注入") && /read path="[^"]+"/.test(clamped), "clamp: 超预算时给带行号的溢出索引而非静默截断");
+check(clamped.includes("未全量注入") && /read path="[^"]+"/.test(clamped), "clamp: 单文件超预算时给带行号的溢出索引而非静默截断");
 store.maxChars = 24000;
 store.injectMode = "index";
-
-rmSync(join(TOPICS, "probe-shard.md"));
 check(!at(CWD).includes("探针分片"), "index: 分片删掉后回落单文件（两种形态都工作）");
 
 // ── 项目层（目录形式）：注入人写索引，只额外列**未被登记**的正文 ──────────────
@@ -404,6 +443,8 @@ check(strings.includes("全局规则文件"), "client: 新增「全局规则文�
 check(strings.includes("AGENTS.md"), "client: 规则层显示 AGENTS.md 一行");
 check(strings.includes("全局记忆"), "client: 面板含「全局记忆」行（可点开看正文）");
 check(strings.includes("项目层（按工作区）"), "client: 面板含项目层分组");
+check(strings.includes("索引预算"), "client: 索引模式显示「索引预算」档位（与正文上限解耦）");
+check(buttons(pane, "12K").length === 1, "client: 索引预算档位 12K 可点（默认值）");
 
 let rows = collect(pane, (n) => n.props?.className === "dm-row");
 check(rows.length === 3, `client: 三行（规则 / 全局 / 1 个项目），实际 ${rows.length}`);

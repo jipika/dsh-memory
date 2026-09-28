@@ -86,6 +86,7 @@
             projectEnabled: {},
             maxChars: 24000,
             injectMode: "index",
+            indexBudget: 12000,
             writeGuard: "rules",
             writeHookCommand: "",
             hookTimeoutMs: 10000,
@@ -112,6 +113,8 @@
                 // 必须带上：漏掉它会让面板永久回落到默认值，档位与输入框都不跟着设置走。
                 maxChars: Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : 24000,
                 injectMode: v.injectMode === "full" ? "full" : "index",
+                // 索引模式的预算：漏掉它 → 面板档位永远回落默认（这条踩过两次，见 memory-system 分片）
+                indexBudget: Number.isFinite(v.indexBudget) ? Math.max(0, Math.floor(v.indexBudget)) : 12000,
                 // 钩子子系统字段：同样必须进快照，否则设置里改了也会被这里洗回默认值。
                 writeGuard: v.writeGuard === "off" || v.writeGuard === "full" ? v.writeGuard : "rules",
                 writeHookCommand: typeof v.writeHookCommand === "string" ? v.writeHookCommand : "",
@@ -243,6 +246,7 @@
           var known = Array.isArray(snap.projects) ? snap.projects : [];
           var maxCharsValue = Number.isFinite(value.maxChars) ? value.maxChars : 24000;
           var injectModeValue = value.injectMode === "full" ? "full" : "index";
+          var indexBudgetValue = Number.isFinite(value.indexBudget) ? value.indexBudget : 12000;
           // 钩子子系统（host 半归一化的同名字段；这里只读值渲染 UI）
           var writeGuardValue = value.writeGuard === "off" || value.writeGuard === "full" ? value.writeGuard : "rules";
           var disciplineValue = value.discipline !== false;
@@ -399,6 +403,8 @@
             var charInfo = layer.status === "ready" && file.exists && file.injected
               ? (function () {
                   var n = (file.text || "").length;
+                  // 索引模式注入的是索引、不是这份正文 —— 用 maxChars 口径描述会误导
+                  if (injectModeValue === "index") return n + " 字符 · 索引模式（正文按需 read，上表只进片级索引）";
                   if (maxCharsValue <= 0) return n + " 字符 · 全量注入";
                   if (n <= maxCharsValue) return n + " 字符 · 全量注入（上限 " + maxCharsValue + "）";
                   return n + " 字符 · 上限 " + maxCharsValue + "，约 " + Math.round((maxCharsValue / n) * 100) + "% 注入，其余转为带行号索引";
@@ -607,8 +613,9 @@
               react.createElement(
                 "p",
                 { className: "dm-limit-desc" },
-                "索引模式（默认）：提示词里只放「片 · 条数 · 路径 · 条目标题与行号」，正文按需读取 —— 记忆再长，每轮注入开销也恒定。" +
-                  "全文注入：把每片正文整篇放进提示词（超预算时保头部 + 附溢出索引）。",
+                "索引模式（默认）：提示词里只放「片名 · 条数 · 最新日期 · 关键词 · 最新条目标题与行号」，正文按需 read —— 记忆再长，每轮注入开销都封顶在「索引预算」内。" +
+                  "预算装不下全量逐条时，**按片收缩为「每片最新 N 条」**（每片都保留线索，不会整层变成空目录）。" +
+                  "全文注入：把分片正文整篇放进提示词；分片总量超过「正文上限」时自动回退索引模式（分片规模下通常都会回退）。",
               ),
               react.createElement(
                 "div",
@@ -627,7 +634,35 @@
                 }),
               ),
               injectModeValue === "index"
-                ? null
+                ? react.createElement(
+                    "div",
+                    { className: "dm-chips" },
+                    react.createElement("span", { className: "dm-limit-desc" }, "索引预算"),
+                    [[6000, "6K"], [12000, "12K"], [18000, "18K"], [24000, "24K"], [0, "不限制"]].map(function (pair) {
+                      return react.createElement(
+                        "button",
+                        {
+                          key: String(pair[0]),
+                          type: "button",
+                          className: indexBudgetValue === pair[0] ? "dm-chip dm-chip-on" : "dm-chip",
+                          onClick: function () { return setting.set("indexBudget", pair[0]); },
+                        },
+                        pair[1],
+                      );
+                    }),
+                    react.createElement("input", {
+                      type: "number",
+                      className: "dm-num",
+                      min: 0,
+                      step: 1000,
+                      value: String(indexBudgetValue),
+                      title: "索引预算（字符，0 = 不限制 → 始终全量逐条）",
+                      onChange: function (e) {
+                        var n = Number(e.target.value);
+                        if (Number.isFinite(n) && n >= 0) setting.set("indexBudget", Math.floor(n));
+                      },
+                    }),
+                  )
                 : react.createElement(
                     "div",
                     { className: "dm-chips" },
