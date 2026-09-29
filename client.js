@@ -665,13 +665,17 @@
                       },
                     }),
                   )
-                : injectModeValue === "map"
-                  ? react.createElement(
-                      "p",
-                      { className: "dm-limit-desc" },
-                      "地图模式不列条目：检索 = 用关键词 grep 记忆目录（命中行自带行号）→ 按行号 read。想让条目标题常驻并受「索引预算」约束，切到「索引模式」。",
-                    )
-                  : react.createElement(
+                : react.createElement(
+                    "div",
+                    null,
+                    injectModeValue === "map"
+                      ? react.createElement(
+                          "p",
+                          { className: "dm-limit-desc" },
+                          "地图模式不列条目：检索 = 用关键词 grep 记忆目录（命中行自带行号）→ 按行号 read。想让条目标题常驻并受「索引预算」约束，切到「索引模式」。目录形态的项目层（人写的 MEMORY.md）仍整篇注入，受下面的「字符预算」约束。",
+                        )
+                      : null,
+                    react.createElement(
                     "div",
                     { className: "dm-chips" },
                     react.createElement("span", { className: "dm-limit-desc" }, "字符预算"),
@@ -699,6 +703,7 @@
                         if (Number.isFinite(n) && n >= 0) setting.set("maxChars", Math.floor(n));
                       },
                     }),
+                  ),
                   ),
             ),
             react.createElement("h3", { className: "dm-group-title" }, "写入 / 读取钩子"),

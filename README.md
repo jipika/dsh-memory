@@ -313,9 +313,10 @@ POST /dsh-memory/settings  { patch }                 # 合并写开关，需请�
 node tests/probe.mjs
 ```
 
-203 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
+207 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
 cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开、**地图模式**（默认值 = `map`、
-片级地图不含条目标题、头注释给出 `grep` 检索指引、层内 ≤ 12 条仍逐条内联、纪律块按档位切换：
+片级地图不含条目标题、头注释给出 `grep` 检索指引、层内 ≤ 12 条仍逐条内联且头注释仍标「地图模式」、
+目录形态的项目层不受档位影响、纪律块按档位切换：
 地图档教 `grep`、索引档不教、full 档说明正文已注入、检索分级写明优先 `subagent_memory`）、**索引模式**（片名取文件 H1、
 条目带行号、分片目录优先于单文件、**片级关键词与最新日期**、**超预算按「每片最新 N 条」配额收缩而非整层归零**、
 `indexBudget=0` 时全量逐条、`injectMode=full` 的多片注入与**超上限自动回退索引**、单文件回落时仍走 clamp 溢出索引）、
@@ -331,7 +332,7 @@ cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开
 `tools/pre-execute` / `tools/post-execute`，以及 client 的 `settings.section` 槽位。
 开关走插件自持的 `settings.json` 与自己的路由，不经过宿主设置服务 —— 0.1.7 把 settings 换成
 cordis Config 表单那次换代不影响它。
-在 DSH 0.1.7-rc.2（Desktop 应用）上验证通过：`node tests/probe.mjs` 203 项全绿。
+在 DSH 0.1.7-rc.2（Desktop 应用）上验证通过：`node tests/probe.mjs` 207 项全绿。
 
 ## License
 

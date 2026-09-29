@@ -228,6 +228,10 @@ check(mapped.includes("关键词：探针关键词甲"), "map: 片级关键词�
 check(!mapped.includes("探针地图分片 条目 01"), "map: 条目标题不进提示词");
 check(!/- \[L\d+\]/.test(mapped), "map: 不再提供条目行号表");
 check(mapped.includes('read path="'), "map: 命中后按行 read 的形状写在头注释里");
+check(
+  mapped.includes("probe project index entry"),
+  "map: 目录形态的项目层仍整篇注入人写索引（刻意不受档位影响，靠 clamp 限长）",
+);
 rmSync(join(TOPICS, "probe-map-shard.md"));
 check(at(CWD).includes("- [L3] shard entry alpha"), "map: 层内条目 ≤ 12 时仍逐条内联（只有大层收成地图）");
 check(
@@ -496,6 +500,10 @@ check(collect(pane, hasClass("dm-chip-on")).map(textOf).includes("地图模式�
 collect(pane, (n) => { for (const c of n.children ?? []) if (typeof c === "string") mapStrings.push(c); });
 check(mapStrings.some((s) => s.includes("地图模式不列条目")), "client: 地图档给出「grep → 按行号 read」说明");
 check(!mapStrings.includes("6K"), "client: 地图档不再显示索引预算档位");
+check(
+  mapStrings.includes("字符预算") && buttons(pane, "24K").length === 1,
+  "client: 地图档仍显示「字符预算」（目录形态项目层的 MEMORY.md 仍受它 clamp）",
+);
 await clickChip("索引模式");
 check(collect(pane, hasClass("dm-chip-on")).map(textOf).includes("索引模式"), "client: 切回索引档后选中态跟着走");
 check(chipTexts(pane).includes("6K") && buttons(pane, "12K").length === 1, "client: 索引档下预算档位回来");
