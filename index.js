@@ -91,6 +91,15 @@ const DEFAULT_INDEX_BUDGET = 12000;
  */
 const INDEX_PER_SHARD_LADDER = [8, 5, 3, 2, 1, 0];
 
+/**
+ * 地图模式（`injectMode: "map"`，**默认档**）的层内内联阈值。
+ *
+ * 条目数 ≤ 该值的层仍然逐条列出标题：这类层本来只有几百字符（项目层单文件就是这种形态），
+ * 内联出来比让模型多跑一次 grep 更值。超过阈值的层（典型是全局分片，35 片 / 333 条）只给
+ * 「片名 · 关键词 · 条数 · 最新日期」的片级地图，条目标题与正文一律按需 grep + read。
+ */
+const MAP_INLINE_MAX_ENTRIES = 12;
+
 /** 项目层记忆目录。 */
 const PROJECT_DIR = `${HOME}/.dsh/memory/projects`;
 
@@ -143,6 +152,9 @@ export {
   contextMessage,
   auditLog,
   DISCIPLINE_BLOCK,
+  disciplineBlock,
+  renderMap,
+  renderLayer,
   normalizeSettings,
   readSettings,
   updateSettings,
@@ -172,7 +184,9 @@ function normalizeSettings(value) {
     globalEnabled: v.globalEnabled !== false,
     projectEnabled: { ...enabled },
     maxChars: budget,
-    injectMode: v.injectMode === "full" ? "full" : "index",
+    // 默认 map（片级地图）：条目标题不常驻，改由 grep 按需取；
+    // index = 地图 + 逐条标题（受 indexBudget 收缩）；full = 正文整篇注入
+    injectMode: v.injectMode === "full" ? "full" : v.injectMode === "index" ? "index" : "map",
     // 索引模式自己的预算：与 maxChars（正文上限）解耦，面板上两个档位各自独立
     indexBudget: Number.isFinite(v.indexBudget) ? Math.max(0, Math.floor(v.indexBudget)) : DEFAULT_INDEX_BUDGET,
     // ── 钩子子系统 ──
@@ -527,14 +541,12 @@ function latestEntryDate(text) {
 }
 
 /**
- * 渲染一层的**注入索引**：片级统计（片名 · 条数 · 体量 · 最新日期 · 关键词）+ 片内条目「标题 · 行号」。
+ * 读一层的全部分片，得到渲染所需的条目化视图（片名 / 关键词 / 最新日期 / 条目 + 行号）。
  *
- * @param {string} header - 层名（写进注释头）。
  * @param {{name:string,path:string}[]} files - 该层文件。
- * @param {number} [perShard] - 每片最多列出的条目数（**从最新的往前取**）；Infinity = 全列，0 = 只列片级统计。
- * @returns {string} 索引正文（无内容时为空串）。
+ * @returns {object[]} 分片数组（空文件已剔除）。
  */
-function renderIndex(header, files, perShard = Infinity) {
+function collectShards(files) {
   const shards = [];
   for (const f of files) {
     const text = readOrEmpty(f.path).trim();
@@ -549,6 +561,61 @@ function renderIndex(header, files, perShard = Infinity) {
       entries: parseEntries(text),
     });
   }
+  return shards;
+}
+
+/** 一层的条目总数（地图模式据此决定「逐条内联」还是「只给地图」）。 */
+function layerEntryTotal(files) {
+  return collectShards(files).reduce((n, s) => n + s.entries.length, 0);
+}
+
+/** 片级统计行（两个渲染器共用）：片名 · 条数 · 体量 · 最新日期 · 路径。 */
+function shardHeadLine(s) {
+  const over = s.text.length > SHARD_WARN_CHARS ? ` ⚠️超建议${SHARD_WARN_CHARS}` : "";
+  const fresh = s.latest ? ` · 最新 ${s.latest}` : "";
+  return `## ${s.name} (${s.entries.length} 条 · ${(s.text.length / 1000).toFixed(1)}k${fresh}${over}) → ${s.path}`;
+}
+
+/**
+ * 渲染一层的**片级地图**（地图模式，默认档）：只有片名 / 关键词 / 条数 / 体量 / 最新日期。
+ *
+ * 与 [renderIndex] 的差别：条目标题与正文都不进提示词。代价是模型必须自己 grep 才看得到
+ * 条目 —— 所以头注释必须把「grep 什么、命中后怎么读」写清楚，否则会退化成「没有线索就不读」
+ * （那个失败模式见 renderIndexBudgeted 的注释）。
+ *
+ * @param {string} header - 层名（写进注释头）。
+ * @param {{name:string,path:string}[]} files - 该层文件。
+ * @returns {string} 地图正文（无内容时为空串）。
+ */
+function renderMap(header, files) {
+  const shards = collectShards(files);
+  if (shards.length === 0) return "";
+  const total = shards.reduce((n, s) => n + s.entries.length, 0);
+  const chars = shards.reduce((n, s) => n + s.text.length, 0);
+  const out = [
+    `<!-- ${header} · 地图模式：${shards.length} 片 / ${total} 条 / ${chars} 字符。`,
+    "     本层只给「片名 · 关键词」级线索，条目标题与正文都不在提示词里。检索两步走：",
+    '       ① grep pattern="<任务关键词>" path="<下面任一 片路径，或整个记忆目录>"',
+    "       ② 命中行自带行号（条目首行形如 `- [YYYY-MM-DD] 事实`）→ 按行号取回",
+    '          read path="<命中的片路径>" offset=<命中行号> limit=<要取几行> -->',
+  ];
+  for (const s of shards) {
+    out.push("", shardHeadLine(s));
+    if (s.keywords) out.push(`   关键词：${s.keywords}`);
+  }
+  return out.join("\n");
+}
+
+/**
+ * 渲染一层的**注入索引**：片级统计（片名 · 条数 · 体量 · 最新日期 · 关键词）+ 片内条目「标题 · 行号」。
+ *
+ * @param {string} header - 层名（写进注释头）。
+ * @param {{name:string,path:string}[]} files - 该层文件。
+ * @param {number} [perShard] - 每片最多列出的条目数（**从最新的往前取**）；Infinity = 全列，0 = 只列片级统计。
+ * @returns {string} 索引正文（无内容时为空串）。
+ */
+function renderIndex(header, files, perShard = Infinity) {
+  const shards = collectShards(files);
   if (shards.length === 0) return "";
 
   const total = shards.reduce((n, s) => n + s.entries.length, 0);
@@ -560,9 +627,7 @@ function renderIndex(header, files, perShard = Infinity) {
     '       read path="<路径>" offset=<L 号> limit=<行数> -->',
   ];
   for (const s of shards) {
-    const over = s.text.length > SHARD_WARN_CHARS ? ` ⚠️超建议${SHARD_WARN_CHARS}` : "";
-    const fresh = s.latest ? ` · 最新 ${s.latest}` : "";
-    out.push("", `## ${s.name} (${s.entries.length} 条 · ${(s.text.length / 1000).toFixed(1)}k${fresh}${over}) → ${s.path}`);
+    out.push("", shardHeadLine(s));
     if (s.keywords) out.push(`   关键词：${s.keywords}`);
     const listed =
       quota === Infinity ? s.entries : quota <= 0 ? [] : s.entries.slice(Math.max(0, s.entries.length - quota));
@@ -605,6 +670,22 @@ function renderIndexBudgeted(header, files) {
 }
 
 /**
+ * 按注入模式渲染**一层**（地图 / 索引）—— compose 用的统一入口。
+ *
+ * 地图模式下条目少的层（≤ [MAP_INLINE_MAX_ENTRIES]）仍走逐条索引：这类层只有几百字符，
+ * 内联出来比让模型多跑一次 grep 更值（项目层单文件就是这种形态）；条目多的层才收成地图。
+ *
+ * @param {string} mode - `map` 或 `index`（`full` 不走这里）。
+ * @param {string} header - 层名。
+ * @param {{name:string,path:string}[]} files - 该层文件。
+ * @returns {string} 注入正文（无内容时为空串）。
+ */
+function renderLayer(mode, header, files) {
+  if (mode === "map" && layerEntryTotal(files) > MAP_INLINE_MAX_ENTRIES) return renderMap(header, files);
+  return renderIndexBudgeted(header, files);
+}
+
+/**
  * full 模式（`injectMode: "full"`）的注入正文。
  *
  * 修 bug（2026-09-28）：旧实现在**全局层**直读 `~/.dsh/memory.md`，但该文件在分片迁移后
@@ -643,11 +724,6 @@ function renderShardFull(header, files) {
   ];
   for (const s of shards) out.push("", `## ${s.name} → ${s.path}`, "", s.text);
   return out.join("\n");
-}
-
-/** 注入模式：`index`（默认，渐进式）或 `full`（整篇注入，超限走 clamp）。 */
-function injectMode() {
-  return readSettings().injectMode;
 }
 
 /**
@@ -723,25 +799,25 @@ function listProjectSlugs() {
  */
 function compose(context) {
   const values = readSettings();
-  const index = injectMode() === "index";
+  const mode = values.injectMode;
   const blocks = [];
 
   // ── 全局层 ──────────────────────────────────────────────────────────────
   if (values.globalEnabled !== false) {
-    if (index) {
-      const body = renderIndexBudgeted(`全局记忆 · ${HOME}/.dsh/memory`, layerFiles(TOPICS_DIR, GLOBAL_MEMORY));
+    if (mode === "full") {
+      // full 模式：走分片正文（而不是已废弃的 memory.md 导航索引）——见 renderShardFull
+      const body = renderShardFull(`全局记忆 · ${HOME}/.dsh/memory`, layerFiles(TOPICS_DIR, GLOBAL_MEMORY));
+      if (body) blocks.push(neutralizePromptVars(body));
+    } else {
+      const body = renderLayer(mode, `全局记忆 · ${HOME}/.dsh/memory`, layerFiles(TOPICS_DIR, GLOBAL_MEMORY));
       if (body) {
-        // 索引里的标题同样可能含 `{{` —— 必须与 full 模式一样拆开，否则整段组装会炸
+        // 索引 / 地图里的标题同样可能含 `{{` —— 必须与 full 模式一样拆开，否则整段组装会炸
         blocks.push(
           neutralizePromptVars(
             `${body}\n\n<!-- 写入本层：往上面某一片追加一行（- [YYYY-MM-DD] 事实），或在同一目录新建主题文件 -->`,
           ),
         );
       }
-    } else {
-      // full 模式：走分片正文（而不是已废弃的 memory.md 导航索引）——见 renderShardFull
-      const body = renderShardFull(`全局记忆 · ${HOME}/.dsh/memory`, layerFiles(TOPICS_DIR, GLOBAL_MEMORY));
-      if (body) blocks.push(neutralizePromptVars(body));
     }
   }
 
@@ -753,11 +829,14 @@ function compose(context) {
       const dir = `${PROJECT_DIR}/${slug}`;
       const indexPath = `${dir}/MEMORY.md`;
       const filePath = `${PROJECT_DIR}/${slug}.md`;
-      if (index) {
-        // 目录形式：MEMORY.md 已是人写索引，走「索引正文 + 孤儿正文清单」
-        // 单文件形式：本身就是条目集合，才值得索引化
+      if (mode !== "full") {
+        // 目录形式：MEMORY.md 已是人写索引，走「索引正文 + 孤儿正文清单」——地图模式同样整篇保留它
+        // （人写的摘要是路由信息，比自动索引更值钱，本来也只有几 k 字符）
+        // 单文件形式：本身就是条目集合，按当前模式渲染（条目少时地图模式仍逐条内联）
         const dirShape = isDir(dir);
-        const body = dirShape ? renderProjectDir(cwd, dir) : renderIndexBudgeted(`项目记忆 · ${cwd}`, layerFiles("", filePath));
+        const body = dirShape
+          ? renderProjectDir(cwd, dir)
+          : renderLayer(mode, `项目记忆 · ${cwd}`, layerFiles("", filePath));
         if (body) {
           blocks.push(
             neutralizePromptVars(
@@ -786,7 +865,7 @@ function compose(context) {
 
   let body = blocks.join("\n\n---\n\n");
   const values2 = readSettings();
-  if (body && values2.discipline !== false) body = `${body}\n\n${DISCIPLINE_BLOCK}`;
+  if (body && values2.discipline !== false) body = `${body}\n\n${disciplineBlock(mode)}`;
   return applyInjectFilter(body);
 }
 
@@ -990,6 +1069,15 @@ const STALE_RE = /(已卸载|已弃用|已删除|不再使用|不再维护|was u
 
 /** bash 里「会改文件」的模式：重定向、tee、sed -i。 */
 const BASH_MUTATE_RE = /(>>|>[^&|]|tee\b|sed\s+(?:[^|]*\s)?-i\b)/;
+
+/** 重定向目标：`> f` / `>> f` / `2> f`。fd 复制（`>&2`）与 `/dev/null` 由提取器丢掉。 */
+const BASH_REDIRECT_RE = /(?:^|[\s;&|()])\d?>>?\s*([^\s;&|()<>]+)/g;
+
+/** tee 的目标文件（跳过 `-a` 之类选项）。 */
+const BASH_TEE_RE = /(?:^|[\s;&|()])tee\b(?:\s+-{1,2}[A-Za-z]+)*\s+([^;&|()]+)/g;
+
+/** sed -i：就地改文件，参数形式太多（macOS 还要跟一个备份后缀），按整条命令保守判。 */
+const BASH_SED_I_RE = /(?:^|[\s;&|()])sed\s+(?:[^;&|()]*?\s)?-i\b/;
 
 /** 记忆路径字面量（bash command 里可能出现的形态）。 */
 const MEMORY_PATH_TOKENS = [`${HOME}/.dsh/memory`, `${HOME}/.dsh/memory.md`, "${HOME}/.dsh/memory", "~/.dsh/memory", "~/.dsh/AGENTS.md"];
@@ -1310,14 +1398,46 @@ function buildWritePayload(tool, args) {
 }
 
 /**
- * bash command 的保守启发式：命令里同时出现记忆路径与「会改文件」的模式 → 交人工确认。
+ * 抽出 bash 命令里真正落盘的目标路径。
+ *
+ * 纯 fd 复制（`>&2`）与 `/dev/null` 不算落盘 —— 这正是「只读命令带
+ * `2>/dev/null` 被误判成改记忆」的根因。只读命令（cat/ls/grep）抽不出任何目标。
+ *
+ * @param {string} command - bash 命令。
+ * @returns {string[]} 目标路径（已去引号）；没有写入时为空数组。
+ */
+function bashWriteTargets(command) {
+  const cmd = String(command ?? "");
+  const out = [];
+  const push = (chunk) => {
+    for (const raw of String(chunk ?? "").split(/\s+/)) {
+      const t = raw.replace(/^["']+|["']+$/g, "");
+      if (!t || t === "/dev/null" || /^&\d*$/.test(t)) continue;
+      out.push(t);
+    }
+  };
+  for (const m of cmd.matchAll(BASH_REDIRECT_RE)) push(m[1]);
+  for (const m of cmd.matchAll(BASH_TEE_RE)) push(m[1]);
+  return out;
+}
+
+/**
+ * bash command 的保守启发式：只有「真的写向记忆路径」才交人工确认。
+ *
+ * 先定位落盘目标，再拿目标比对记忆路径字面量；不再因为命令里同时出现
+ * 记忆路径和任意一个 `>`（如 `... 2>/dev/null`）就误判。sed -i 无法可靠
+ * 拆出目标，退回整条命令判定（保守）。
+ *
  * @param {string} command - bash 命令。
  * @returns {boolean} 是否命中。
  */
 function bashTouchesMemory(command) {
   const cmd = String(command ?? "");
   if (!BASH_MUTATE_RE.test(cmd)) return false;
-  return MEMORY_PATH_TOKENS.some((t) => cmd.includes(t));
+  if (BASH_SED_I_RE.test(cmd)) return MEMORY_PATH_TOKENS.some((t) => cmd.includes(t));
+  const scope = bashWriteTargets(cmd).join(" ");
+  if (!scope) return false;
+  return MEMORY_PATH_TOKENS.some((t) => scope.includes(t));
 }
 
 /** 写入钩子的当前配置。 */
@@ -1442,16 +1562,47 @@ async function postExecuteHook(exec, result, next) {
   return downstream;
 }
 
-/** 注入层强制附加的记忆纪律块。 */
-const DISCIPLINE_BLOCK = [
-  "<!-- 记忆纪律（dsh-memory 钩子强制执行，不只是建议）：",
-  "     · 【开工先查】非琐碎任务开头先扫上面的索引：用任务里的关键词（框架/工具/文件名/报错码/用户原话里的名词）去匹配片名与「关键词」行，命中就 read 该片对应行号再动手；没命中就不读，别整库通读",
-  "     · 【读法】按行号精确 read（offset = 条目行号），禁止凭片名或标题臆测内容；某片只列了最新几条时，按提示的行号区间读更早的条目",
+/**
+ * 各注入模式的**开场两条**纪律（检索方式随档位变，其余条共用）。
+ *
+ * 地图模式（默认）下条目标题不在提示词里，所以第一条必须给出确定动作（grep），否则会退化成
+ * 「没线索就不读」—— 那个失败模式在 2026-09-28 的索引预算事故里已经见过一次。
+ */
+const DISCIPLINE_HEAD = {
+  map: [
+    "     · 【开工先查】非琐碎任务开头先取线索：拿任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）去 grep 记忆目录 —— 全局为 `~/.dsh/memory/topics`，项目层路径见下面各片段；命中片名 / 行号再动手，没命中就不读，别整库通读",
+    "     · 【读法】命中行自带行号 → `read path=<片路径> offset=<行号> limit=<要几条>`；片名与关键词只说明主题、不保证内容，禁止凭片名臆测",
+  ],
+  index: [
+    "     · 【开工先查】非琐碎任务开头先扫上面的索引：用任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）去匹配片名与「关键词」行，命中就 read 该片对应行号再动手；没命中就不读，别整库通读",
+    "     · 【读法】按行号精确 read（offset = 条目行号），禁止凭片名或标题臆测内容；某片只列了最新几条时，按提示的行号区间读更早的条目",
+  ],
+  full: [
+    "     · 【正文已在提示词里】本层记忆已整篇注入，直接用即可，不必再 read 同一份文件；只有片级统计提到而正文没展开的部分才需要读",
+  ],
+};
+
+/** 与注入模式无关的通用纪律。 */
+const DISCIPLINE_TAIL = [
+  "     · 【检索分级】要同时读 ≥3 条 / 跨 ≥2 片 / 某片正文 ≥3k 字符时 → 派子代理（搜索型）检索，只让它回「与任务相关的事实 + 所在文件与行号」，不要把整片原文带回主对话（原文留在它的上下文里）；1–2 条由主代理自己读更省",
   "     · 【写入判据】值得记：可复用的结论、用户偏好、坑与成因；不值得记：过程叙述、能从仓库或 git 推导的内容、一次性中间状态",
   "     · 条目格式 `- [YYYY-MM-DD] 事实`；全局层写 ~/.dsh/memory/topics/ 分片（**新片首行写 `<!-- 片名 · 关键词… -->`**，关键词会进索引供路由），项目层写对应文件并登记 MEMORY.md；某片出现 ⚠️超建议 时按子主题就地拆片",
   "     · 同一事实有了新结论就**就地改写那一行**（不追加第二条、不写「已改为」的变迁史）；发现过时条目就地修正",
-  "     · 写入动作由钩子校验：格式错/含凭据/覆盖历史 → 直接拒绝（deny，原因会回到你面前）；可疑改动 → 转人工确认（ask） -->",
-].join("\n");
+  "     · 写入动作由钩子校验：格式错/含凭据/覆盖历史 → 直接拒绝（deny，原因会回到你面前）；可疑改动 → 转人工确认（ask）",
+];
+
+/**
+ * 按注入模式取纪律块。
+ * @param {string} mode - `map` / `index` / `full`（未知值按 `index` 处理）。
+ * @returns {string} 纪律块正文。
+ */
+function disciplineBlock(mode) {
+  const head = DISCIPLINE_HEAD[mode] ?? DISCIPLINE_HEAD.index;
+  return ["<!-- 记忆纪律（dsh-memory 钩子强制执行，不只是建议）：", ...head, ...DISCIPLINE_TAIL, " -->"].join("\n");
+}
+
+/** 注入层强制附加的记忆纪律块（索引档文本；其它档位由 [disciplineBlock] 现取）。 */
+const DISCIPLINE_BLOCK = disciplineBlock("index");
 
 /**
  * 对注入文本应用可选的外部过滤命令（同步；compose 的 text 是同步求值）。

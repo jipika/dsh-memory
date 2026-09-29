@@ -203,6 +203,31 @@ store.indexBudget = 12000;
 rmSync(join(TOPICS, "probe-shard-2.md"));
 rmSync(join(TOPICS, "probe-shard-3.md"));
 
+// ── 地图模式（默认档）：只给片级地图 + grep 检索指引，条目标题不常驻（2026-09-29）────
+check(host.normalizeSettings({}).injectMode === "map", "map: injectMode 默认 = map（地图模式）");
+check(host.normalizeSettings({ injectMode: "bogus" }).injectMode === "map", "map: 未知档位回落 map");
+check(host.normalizeSettings({ injectMode: "index" }).injectMode === "index", "map: 显式 index 不被改写");
+check(
+  host.disciplineBlock("map").includes("grep") && host.disciplineBlock("map").includes("子代理"),
+  "map: 纪律块给出「grep 取线索」+「子代理检索」两级",
+);
+check(!/grep pattern=/.test(host.disciplineBlock("index")), "map: 索引档纪律块不教 grep（标题已在提示词里）");
+check(host.disciplineBlock("full").includes("正文已在提示词里"), "map: full 档纪律块说明正文已注入");
+
+writeFileSync(join(TOPICS, "probe-map-shard.md"), probeShard("探针地图分片", 20));
+store.injectMode = "map";
+const mapped = at(CWD);
+check(mapped.includes("地图模式"), "map: 头注释标明地图模式");
+check(mapped.includes("grep pattern="), "map: 给出 grep 检索指引（命中行自带行号）");
+check(mapped.includes("## 探针地图分片 (20 条"), "map: 片级统计（片名 · 条数）仍在");
+check(mapped.includes("关键词：探针关键词甲"), "map: 片级关键词仍在（路由靠它）");
+check(!mapped.includes("探针地图分片 条目 01"), "map: 条目标题不进提示词");
+check(!/- \[L\d+\]/.test(mapped), "map: 不再提供条目行号表");
+check(mapped.includes('read path="'), "map: 命中后按行 read 的形状写在头注释里");
+rmSync(join(TOPICS, "probe-map-shard.md"));
+check(at(CWD).includes("- [L3] shard entry alpha"), "map: 层内条目 ≤ 12 时仍逐条内联（只有大层收成地图）");
+store.injectMode = "index";
+
 // clamp 只作用于「单文件回落」形态：先移走分片，让它回落到 memory.md
 rmSync(join(TOPICS, "probe-shard.md"));
 store.maxChars = 20;
@@ -446,6 +471,26 @@ check(strings.includes("项目层（按工作区）"), "client: 面板含项目�
 check(strings.includes("索引预算"), "client: 索引模式显示「索引预算」档位（与正文上限解耦）");
 check(buttons(pane, "12K").length === 1, "client: 索引预算档位 12K 可点（默认值）");
 
+// ── 注入方式三档：切到地图档 → 检索说明 + 预算档位退场；再切回索引档 ──────────
+// 面板快照只在挂载时拉一次，所以这里走「点 chip → setting.set 乐观更新 → 等 400ms 合并提交落地」。
+const clickChip = async (label) => {
+  const chip = collect(render(), (n) => n.type === "button" && textOf(n) === label)[0];
+  check(chip !== undefined, `client: 注入方式含「${label}」档`);
+  chip.props.onClick();
+  await new Promise((r) => setTimeout(r, 450));
+  pane = render();
+};
+const chipTexts = (p) => collect(p, hasClass("dm-chip")).map(textOf);
+const mapStrings = [];
+await clickChip("地图模式（默认）");
+check(collect(pane, hasClass("dm-chip-on")).map(textOf).includes("地图模式（默认）"), "client: 地图档是当前选中态");
+collect(pane, (n) => { for (const c of n.children ?? []) if (typeof c === "string") mapStrings.push(c); });
+check(mapStrings.some((s) => s.includes("地图模式不列条目")), "client: 地图档给出「grep → 按行号 read」说明");
+check(!mapStrings.includes("6K"), "client: 地图档不再显示索引预算档位");
+await clickChip("索引模式");
+check(collect(pane, hasClass("dm-chip-on")).map(textOf).includes("索引模式"), "client: 切回索引档后选中态跟着走");
+check(chipTexts(pane).includes("6K") && buttons(pane, "12K").length === 1, "client: 索引档下预算档位回来");
+
 let rows = collect(pane, (n) => n.props?.className === "dm-row");
 check(rows.length === 3, `client: 三行（规则 / 全局 / 1 个项目），实际 ${rows.length}`);
 const switches = collect(pane, (n) => n.props?.role === "switch");
@@ -595,6 +640,12 @@ check(host.parseHookOutcome(1, "", "boom").decision === "allow" && !!host.parseH
 
 check(host.bashTouchesMemory("echo x >> ~/.dsh/memory/topics/a.md") === true, "hook: bash 重定向写记忆命中");
 check(host.bashTouchesMemory("cat ~/.dsh/memory/topics/a.md") === false && host.bashTouchesMemory("ls ~/.dsh/memory") === false, "hook: bash 只读记忆不拦");
+// 回归：只读命令 + 2>/dev/null（`>` 撞旧正则）曾被误判成改记忆 → ask
+check(host.bashTouchesMemory("cat ~/.dsh/memory/settings.json 2>/dev/null") === false, "hook: bash 只读 + 2>/dev/null 不误判");
+check(host.bashTouchesMemory("cat ~/.dsh/memory/topics/a.md 2>&1 | tail -5") === false, "hook: bash fd 复制 2>&1 不误判");
+check(host.bashTouchesMemory("cat ~/.dsh/memory/topics/a.md > /tmp/out.txt") === false, "hook: bash 导出到 /dev 之外的非记忆路径不拦");
+check(host.bashTouchesMemory("echo hi | tee -a ~/.dsh/memory/topics/a.md") === true, "hook: bash tee 写记忆命中");
+check(host.bashTouchesMemory("sed -i '' 's/a/b/' ~/.dsh/memory/AGENTS.md") === true, "hook: bash sed -i 改记忆命中（保守按整条判）");
 
 // 端到端：writeGuardHook / postExecuteHook 挂载与决策
 check(typeof mountedHooks["tools/pre-execute"] === "function" && typeof mountedHooks["tools/post-execute"] === "function", "hook: pre/post-execute 已挂载");
@@ -611,6 +662,10 @@ check(
 check(
   (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "echo x >> ~/.dsh/memory/topics/a.md" } }, passNext)).kind === "ask",
   "hook: bash 改记忆 → ask（转人工确认）",
+);
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "cat ~/.dsh/memory/settings.json 2>/dev/null" } }, passNext)) === NEXT_PASSED,
+  "hook: bash 只读命令（带 2>/dev/null）→ 直接放行",
 );
 store.writeGuard = "off";
 check(

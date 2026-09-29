@@ -85,7 +85,7 @@
             globalEnabled: true,
             projectEnabled: {},
             maxChars: 24000,
-            injectMode: "index",
+            injectMode: "map",
             indexBudget: 12000,
             writeGuard: "rules",
             writeHookCommand: "",
@@ -112,7 +112,7 @@
                 projectEnabled: v.projectEnabled !== null && typeof v.projectEnabled === "object" ? v.projectEnabled : {},
                 // 必须带上：漏掉它会让面板永久回落到默认值，档位与输入框都不跟着设置走。
                 maxChars: Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : 24000,
-                injectMode: v.injectMode === "full" ? "full" : "index",
+                injectMode: v.injectMode === "full" ? "full" : v.injectMode === "index" ? "index" : "map",
                 // 索引模式的预算：漏掉它 → 面板档位永远回落默认（这条踩过两次，见 memory-system 分片）
                 indexBudget: Number.isFinite(v.indexBudget) ? Math.max(0, Math.floor(v.indexBudget)) : 12000,
                 // 钩子子系统字段：同样必须进快照，否则设置里改了也会被这里洗回默认值。
@@ -245,7 +245,7 @@
           var projectEnabled = value.projectEnabled || {};
           var known = Array.isArray(snap.projects) ? snap.projects : [];
           var maxCharsValue = Number.isFinite(value.maxChars) ? value.maxChars : 24000;
-          var injectModeValue = value.injectMode === "full" ? "full" : "index";
+          var injectModeValue = value.injectMode === "full" ? "full" : value.injectMode === "index" ? "index" : "map";
           var indexBudgetValue = Number.isFinite(value.indexBudget) ? value.indexBudget : 12000;
           // 钩子子系统（host 半归一化的同名字段；这里只读值渲染 UI）
           var writeGuardValue = value.writeGuard === "off" || value.writeGuard === "full" ? value.writeGuard : "rules";
@@ -404,6 +404,7 @@
               ? (function () {
                   var n = (file.text || "").length;
                   // 索引模式注入的是索引、不是这份正文 —— 用 maxChars 口径描述会误导
+                  if (injectModeValue === "map") return n + " 字符 · 地图模式（只进片级地图，条目按需 grep + read）";
                   if (injectModeValue === "index") return n + " 字符 · 索引模式（正文按需 read，上表只进片级索引）";
                   if (maxCharsValue <= 0) return n + " 字符 · 全量注入";
                   if (n <= maxCharsValue) return n + " 字符 · 全量注入（上限 " + maxCharsValue + "）";
@@ -613,14 +614,15 @@
               react.createElement(
                 "p",
                 { className: "dm-limit-desc" },
-                "索引模式（默认）：提示词里只放「片名 · 条数 · 最新日期 · 关键词 · 最新条目标题与行号」，正文按需 read —— 记忆再长，每轮注入开销都封顶在「索引预算」内。" +
-                  "预算装不下全量逐条时，**按片收缩为「每片最新 N 条」**（每片都保留线索，不会整层变成空目录）。" +
+                "地图模式（默认）：提示词里只放**片级地图** —— 片名 · 关键词 · 条数 · 体量 · 最新日期；条目标题与正文都不进提示词，模型拿任务关键词 grep 记忆目录、按命中行号 read。" +
+                  "条目 ≤ 12 条的层（典型是项目层单文件）仍逐条内联，省掉一次检索。" +
+                  "索引模式：地图 + 每片最新 N 条「标题 · 行号」，受「索引预算」约束 —— 预算装不下全量逐条时按片收缩为「每片最新 N 条」，不会整层变成空目录。" +
                   "全文注入：把分片正文整篇放进提示词；分片总量超过「正文上限」时自动回退索引模式（分片规模下通常都会回退）。",
               ),
               react.createElement(
                 "div",
                 { className: "dm-chips" },
-                [["index", "索引模式（默认）"], ["full", "全文注入"]].map(function (pair) {
+                [["map", "地图模式（默认）"], ["index", "索引模式"], ["full", "全文注入"]].map(function (pair) {
                   return react.createElement(
                     "button",
                     {
@@ -663,7 +665,13 @@
                       },
                     }),
                   )
-                : react.createElement(
+                : injectModeValue === "map"
+                  ? react.createElement(
+                      "p",
+                      { className: "dm-limit-desc" },
+                      "地图模式不列条目：检索 = 用关键词 grep 记忆目录（命中行自带行号）→ 按行号 read。想让条目标题常驻并受「索引预算」约束，切到「索引模式」。",
+                    )
+                  : react.createElement(
                     "div",
                     { className: "dm-chips" },
                     react.createElement("span", { className: "dm-limit-desc" }, "字符预算"),

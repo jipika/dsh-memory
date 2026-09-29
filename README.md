@@ -1,12 +1,14 @@
 # dsh-memory
 
 > Progressive long-term memory for **DeepSeek Harness (DSH)** — memory lives as sharded plain
-> markdown, and only a **live-generated index** enters the system prompt, so the prompt cost
-> stays flat however large the memory grows. Two layers (global + per-project) plus the global
+> markdown, and only a **live-generated map** (shard · keywords · count · latest date) enters the
+> system prompt, so the prompt cost stays flat however large the memory grows; entries are pulled
+> on demand with `grep` + `read`. Two layers (global + per-project) plus the global
 > rule files, **viewable and editable right in DSH Settings**, **zero extra LLM cost**, live re-read.
 >
 > 给 DeepSeek Harness 的**渐进式长期记忆**：正文是分片的纯 markdown，进系统提示词的只有
-> **实时生成的索引**（片 · 条数 · 路径 · 条目行号），记忆再长、提示词开销也恒定。两层结构
+> **实时生成的片级地图**（片 · 关键词 · 条数 · 最新日期），条目按任务关键词 `grep` 命中行号再 `read`
+> 取回 —— 记忆再长、提示词开销也恒定。两层结构
 > （全局层 + 项目层）外加全局规则文件，**在设置里就能查看并编辑**、**不产生任何额外 LLM 调用**、写完即生效。
 
 [![npm](https://img.shields.io/npm/v/@jipika/dsh-memory?label=npm)](https://www.npmjs.com/package/@jipika/dsh-memory)
@@ -38,20 +40,26 @@ agent 顺手完成** —— 于是它既不花钱，也不出本机，还能被 
 - **零 LLM 成本**：插件本身不调用任何模型，只读文件；写记忆用的是会话已经在跑的那个模型。
 - **写完即生效**：注册的是**函数式** `text`，每次提示词组装都重读文件 —— 不需要重启、不需要刷新。
   （对比：`cordis.patch.yml` 里 `personaPrefix` 的 `!!js` 只在 boot 求值一次。）
-- **渐进式注入，记忆再长也不炸上下文**：注入的是**实时生成的索引** —— 每片一行
-  「片名 · 条数 · 体量 · 最新日期 · 关键词」，片内每条一行「标题 + 行号」；需要细节时 agent 按行号 `read`
-  那一片即可。索引每次组装现算，所以**永远不会和正文脱节**，正文怎么长、注入体积都封顶在预算内。
-  实测：把 58k 字符的记忆分成 10 片后，每轮注入从 **29931 → 约 6.6k 字符**；
-  27 片 / 285 条 / 198k 字符的真实库注入约 **11.8k 字符**（含 121 条标题与全部片级线索）。
-- **预算内按片配额，绝不整层归零**（v0.6.0 修）：索引超过「索引预算」（默认 12000 字符，面板可调
-  6K/12K/18K/24K/不限制）时，沿 `[8,5,3,2,1]` 逐档收缩为**每片最新 N 条**，每片都保留线索
-  （关键词 + 最新日期 + 「更早的 M 条在第 X–Y 行」），而不是把整层压成一行「N 条；索引预算已满」。
-  旧行为在 27 片规模下会让**所有**分片同时失去标题 —— agent 因此没有任何理由去 `read`，
-  表现就是「插件明明在注入，却不读记忆」。
+- **渐进式注入，记忆再长也不炸上下文**：默认**地图模式** —— 提示词里只有**片级地图**
+  「片名 · 条数 · 体量 · 最新日期 · 关键词」，条目标题与正文都不进提示词；agent 拿任务关键词
+  `grep` 记忆目录，命中行自带行号，再按行 `read` 取那一条。条目 ≤ 12 条的层（典型是项目层单文件）
+  仍逐条内联 —— 这类层只有几百字符，内联出来比多跑一次检索更值。
+  实测：58k 字符的单文件拆成 10 片后，每轮注入从 **29931 → 约 6.6k 字符**；
+  35 片 / 333 条 / 233k 字符的真实库：**地图模式 7.3k 字符**，索引模式 12.9k 字符。
+- **三档注入方式**（设置 → 记忆 →「注入方式」）：
+  - **地图模式（默认）**：只给片级地图，条目靠 `grep` + 按行 `read` 按需取 —— 注入最省，
+    且**路由线索（片名 + 关键词）一条不少**：没有它，agent 不知道自己缺什么，也就不会去查。
+  - **索引模式**：地图 + 每片最新 N 条「标题 · 行号」，超「索引预算」（默认 12000 字符，面板可调
+    6K/12K/18K/24K/不限制）时沿 `[8,5,3,2,1]` 逐档收缩为**每片最新 N 条**，每片都保留线索
+    （关键词 + 最新日期 + 「更早的 M 条在第 X–Y 行」），而不是把整层压成一行「N 条；索引预算已满」。
+    旧行为在 27 片规模下会让**所有**分片同时失去标题 —— agent 因此没有任何理由去 `read`，
+    表现就是「插件明明在注入，却不读记忆」。
+  - **全文注入**：分片正文整篇进提示词，总量超过字符上限时**自动回退索引模式并说明原因**
+    （分片规模下通常都会回退）。
+- **跨片检索交给子代理**：注入的纪律块写明分级 —— 1–2 条自己 `read`；要同时读 ≥3 条 / 跨 ≥2 片 /
+  某片正文 ≥3k 字符时派子代理检索，只让它回「事实 + 文件与行号」，原文留在子代理的上下文里。
 - **片级关键词 = 最便宜的检索线索**：分片首行注释 `<!-- 片名 · 关键词… -->` 里 `·`（或 `：`）
-  之后那段会进索引，对齐 Claude Skills 用 `description` 决定「要不要加载」的思路。
-- 想要老行为？设置 → 记忆 →「注入方式」切成**全文注入**：分片正文整篇进提示词，
-  总量超过字符上限时**自动回退索引模式并说明原因**（分片规模下通常都会回退）。
+  之后那段会进地图/索引，对齐 Claude Skills 用 `description` 决定「要不要加载」的思路。
 - **设置面板可读可写**：DSH 设置里多一个「记忆」分栏 —— 每层一个开关，点标题即可展开正文，
   还能**就地把改动保存回文件**（保存前自动留一份 `.bak`）。全局层按片一个页签；同一个分栏里
   可以查看并编辑**全局规则文件** `~/.dsh/AGENTS.md`。
@@ -181,12 +189,14 @@ Memory upkeep (long-term memory):
 {
   "globalEnabled": true,
   "projectEnabled": { "--Users-me-code-repo--": false },
-  "injectMode": "index",
+  "injectMode": "map",
   "indexBudget": 12000,
   "maxChars": 24000
 }
 ```
 
+- `injectMode`：`map`（默认，片级地图 + `grep` 按需取条目）/ `index`（地图 + 逐条标题）/
+  `full`（正文整篇注入）。
 - `indexBudget`：**索引模式**每轮注入的字符预算（0 = 不限制 → 始终全量逐条）。
   超预算时按 `[8,5,3,2,1]` 逐档收缩为「每片最新 N 条」，**不会整层归零**。
 - `maxChars`：**正文**上限，管两件事 —— full 模式的分片总量闸门、项目层 `MEMORY.md` 的 clamp。
@@ -209,7 +219,7 @@ agent 用 `write` / `edit` 触碰记忆管辖路径（`~/.dsh/memory/**`、`~/.d
 | 新条目格式不是 `- [YYYY-MM-DD] 事实`（或日期非法/在未来） | deny + 给出正确格式 |
 | 新增内容疑似凭据（sk- / AKIA / ghp_ / Bearer / password= 等 8 类） | deny（只报行号与模式名，不回显值） |
 | `write` 整文件覆写导致既有条目变少 | deny + 要求改追加/edit |
-| `bash` 重定向/tee/sed -i 改记忆文件 | ask（转人工确认） |
+| `bash` 重定向/tee/`sed -i` 改记忆文件 | ask（转人工确认）；只认**真正落盘的目标** —— `2>/dev/null`、`>&2` 这类 fd 复制与丢向 `/dev/null` 不算，只读命令不会被误拦 |
 | 过时陈述（「已卸载/不再使用」式）、单条超长 | allow + 审计 note |
 
 `writeGuard: "full"` 时在内置规则之上再跑一个**外部判定命令**（`writeHookCommand`）：
@@ -301,14 +311,17 @@ POST /dsh-memory/settings  { patch }                 # 合并写开关，需请�
 node tests/probe.mjs
 ```
 
-175 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
-cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开、**索引模式**（片名取文件 H1、
+202 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
+cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开、**地图模式**（默认值 = `map`、
+片级地图不含条目标题、头注释给出 `grep` 检索指引、层内 ≤ 12 条仍逐条内联、纪律块按档位切换：
+地图档教 `grep`、索引档不教、full 档说明正文已注入）、**索引模式**（片名取文件 H1、
 条目带行号、分片目录优先于单文件、**片级关键词与最新日期**、**超预算按「每片最新 N 条」配额收缩而非整层归零**、
 `indexBudget=0` 时全量逐条、`injectMode=full` 的多片注入与**超上限自动回退索引**、单文件回落时仍走 clamp 溢出索引）、
 注入前拆开 `{{`（否则整段组装会被 `dsh-system-prompt` 当未知变量抛错）、读路由（层内文件清单、AGENTS.md、
 单文件形式、路径穿越被拒）、写路由（原子写、`.bak` 回滚点、权限保留、首次建 MEMORY.md、内容未变不重复写、
 白名单外写不进去、缺 `x-dsh-memory` 头 → 403）、钩子规则引擎（格式/凭据/覆写历史/bash 改写）与审计，
-以及设置面板的渲染与「展开 → 编辑 → 保存」全流程。
+以及设置面板的渲染、「注入方式」三档切换（地图 / 索引 / 全文，含档位联动的预算档位显隐）
+与「展开 → 编辑 → 保存」全流程。
 
 ## 兼容性
 
@@ -316,7 +329,7 @@ cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开
 `tools/pre-execute` / `tools/post-execute`，以及 client 的 `settings.section` 槽位。
 开关走插件自持的 `settings.json` 与自己的路由，不经过宿主设置服务 —— 0.1.7 把 settings 换成
 cordis Config 表单那次换代不影响它。
-在 DSH 0.1.7-rc.2（Desktop 应用）上验证通过：`node tests/probe.mjs` 175 项全绿。
+在 DSH 0.1.7-rc.2（Desktop 应用）上验证通过：`node tests/probe.mjs` 202 项全绿。
 
 ## License
 
