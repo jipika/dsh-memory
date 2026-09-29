@@ -612,9 +612,11 @@ function renderMap(header, files) {
  * @param {string} header - 层名（写进注释头）。
  * @param {{name:string,path:string}[]} files - 该层文件。
  * @param {number} [perShard] - 每片最多列出的条目数（**从最新的往前取**）；Infinity = 全列，0 = 只列片级统计。
+ * @param {string} [label] - 头注释里的档位名。地图模式下小层内联时要传，否则同一份注入里出现
+ *   「地图模式」（全局段）与「索引模式」（项目段）两种措辞，模型会以为有两套检索方式。
  * @returns {string} 索引正文（无内容时为空串）。
  */
-function renderIndex(header, files, perShard = Infinity) {
+function renderIndex(header, files, perShard = Infinity, label = "索引模式") {
   const shards = collectShards(files);
   if (shards.length === 0) return "";
 
@@ -622,7 +624,7 @@ function renderIndex(header, files, perShard = Infinity) {
   const chars = shards.reduce((n, s) => n + s.text.length, 0);
   const quota = perShard <= 0 ? 0 : Number.isFinite(perShard) ? Math.floor(perShard) : Infinity;
   const out = [
-    `<!-- ${header} · 索引模式：${shards.length} 片 / ${total} 条 / ${chars} 字符。`,
+    `<!-- ${header} · ${label}：${shards.length} 片 / ${total} 条 / ${chars} 字符。`,
     "     正文不在提示词里 —— 需要细节时按下面的路径读取（offset 就是条目行号）：",
     '       read path="<路径>" offset=<L 号> limit=<行数> -->',
   ];
@@ -656,17 +658,18 @@ function renderIndex(header, files, perShard = Infinity) {
  *
  * @param {string} header - 层名。
  * @param {{name:string,path:string}[]} files - 该层文件。
+ * @param {string} [label] - 透传给 [renderIndex] 的档位名。
  * @returns {string} 索引正文。
  */
-function renderIndexBudgeted(header, files) {
+function renderIndexBudgeted(header, files, label = "索引模式") {
   const budget = indexBudget();
-  const full = renderIndex(header, files);
+  const full = renderIndex(header, files, Infinity, label);
   if (budget <= 0 || full.length <= budget) return full;
   for (const perShard of INDEX_PER_SHARD_LADDER) {
-    const text = renderIndex(header, files, perShard);
+    const text = renderIndex(header, files, perShard, label);
     if (text.length <= budget) return text;
   }
-  return renderIndex(header, files, 0);
+  return renderIndex(header, files, 0, label);
 }
 
 /**
@@ -682,7 +685,10 @@ function renderIndexBudgeted(header, files) {
  */
 function renderLayer(mode, header, files) {
   if (mode === "map" && layerEntryTotal(files) > MAP_INLINE_MAX_ENTRIES) return renderMap(header, files);
-  return renderIndexBudgeted(header, files);
+  // 地图模式下走到这里 = 「本层条目少」：照样内联逐条，但头注释要说清是哪一档，
+  // 否则同一份注入里会同时出现「地图模式」（条目多的层）与「索引模式」（条目少的层），
+  // 模型会以为有两套检索方式（2026-09-29 由检索子代理指出）。
+  return renderIndexBudgeted(header, files, mode === "map" ? "地图模式 · 本层条目少，已逐条内联" : "索引模式");
 }
 
 /**

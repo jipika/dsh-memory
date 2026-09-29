@@ -230,6 +230,11 @@ check(!/- \[L\d+\]/.test(mapped), "map: 不再提供条目行号表");
 check(mapped.includes('read path="'), "map: 命中后按行 read 的形状写在头注释里");
 rmSync(join(TOPICS, "probe-map-shard.md"));
 check(at(CWD).includes("- [L3] shard entry alpha"), "map: 层内条目 ≤ 12 时仍逐条内联（只有大层收成地图）");
+check(
+  at(CWD).includes("地图模式 · 本层条目少，已逐条内联"),
+  "map: 小层内联时头注释仍标「地图模式」，同一份注入里不混两套档位名",
+);
+check(!at(CWD).includes("索引模式"), "map: 地图模式下不会混入「索引模式」措辞（子代理曾因此以为有两套检索方式）");
 store.injectMode = "index";
 
 // clamp 只作用于「单文件回落」形态：先移走分片，让它回落到 memory.md
