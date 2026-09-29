@@ -211,6 +211,10 @@ check(
   host.disciplineBlock("map").includes("grep") && host.disciplineBlock("map").includes("子代理"),
   "map: 纪律块给出「grep 取线索」+「子代理检索」两级",
 );
+check(
+  host.disciplineBlock("map").includes("subagent_memory") && host.disciplineBlock("map").includes("退回"),
+  "map: 检索子代理优先 subagent_memory，且写明无该工具时退回 subagent",
+);
 check(!/grep pattern=/.test(host.disciplineBlock("index")), "map: 索引档纪律块不教 grep（标题已在提示词里）");
 check(host.disciplineBlock("full").includes("正文已在提示词里"), "map: full 档纪律块说明正文已注入");
 
