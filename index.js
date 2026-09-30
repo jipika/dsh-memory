@@ -593,7 +593,11 @@ function renderMap(header, files) {
   const total = shards.reduce((n, s) => n + s.entries.length, 0);
   const chars = shards.reduce((n, s) => n + s.text.length, 0);
   const out = [
-    `<!-- ${header} · 地图模式：${shards.length} 片 / ${total} 条 / ${chars} 字符。`,
+    // 头行刻意只放档位，不放「N 片 / M 条 / K 字符」：那三个数字每写一条记忆就变，
+    // 而头行在 system prompt 最前面 —— 一变就让整个前缀失去缓存（2026-09-30 实测：
+    // 写一条记忆后，同款子代理委派的首轮 cacheRead 从 85% 掉回 0%）。
+    // 统计一律挪到段尾，让"变化点"尽量靠后。
+    `<!-- ${header} · 地图模式。`,
     "     本层只给「片名 · 关键词」级线索，条目标题与正文都不在提示词里。检索两步走：",
     '       ① grep pattern="<任务关键词>" path="<下面任一 片路径，或整个记忆目录>"',
     "       ② 命中行自带行号（条目首行形如 `- [YYYY-MM-DD] 事实`）→ 按行号取回",
@@ -603,6 +607,7 @@ function renderMap(header, files) {
     out.push("", shardHeadLine(s));
     if (s.keywords) out.push(`   关键词：${s.keywords}`);
   }
+  out.push("", `<!-- 本层：${shards.length} 片 / ${total} 条 / ${chars} 字符 -->`);
   return out.join("\n");
 }
 
@@ -624,7 +629,8 @@ function renderIndex(header, files, perShard = Infinity, label = "索引模式")
   const chars = shards.reduce((n, s) => n + s.text.length, 0);
   const quota = perShard <= 0 ? 0 : Number.isFinite(perShard) ? Math.floor(perShard) : Infinity;
   const out = [
-    `<!-- ${header} · ${label}：${shards.length} 片 / ${total} 条 / ${chars} 字符。`,
+    // 头行只放档位，统计挪到段尾 —— 理由同 renderMap（避免"写一条记忆就让前缀全失效"）。
+    `<!-- ${header} · ${label}。`,
     "     正文不在提示词里 —— 需要细节时按下面的路径读取（offset 就是条目行号）：",
     '       read path="<路径>" offset=<L 号> limit=<行数> -->',
   ];
@@ -644,6 +650,7 @@ function renderIndex(header, files, perShard = Infinity, label = "索引模式")
       out.push(`- （上面只列最新 ${listed.length} 条；更早的 ${hidden} 条在同文件第 ${s.entries[0].line}–${lastHidden} 行）`);
     }
   }
+  out.push("", `<!-- 本层：${shards.length} 片 / ${total} 条 / ${chars} 字符 -->`);
   return out.join("\n");
 }
 
@@ -725,10 +732,10 @@ function renderShardFull(header, files) {
       ` → 自动回退索引模式（要强制全文请把「正文上限」设为 0 = 不限制） -->\n\n${renderIndexBudgeted(header, files)}`
     );
   }
-  const out = [
-    `<!-- ${header} · 全文注入：${shards.length} 片 / ${chars} 字符${budget > 0 ? ` · 上限 ${budget}` : " · 不限制"} -->`,
-  ];
+  // 头行只放档位（理由同 renderMap）：片数与字符数每写一条记忆就变，放头行会毁掉整个前缀。
+  const out = [`<!-- ${header} · 全文注入。`];
   for (const s of shards) out.push("", `## ${s.name} → ${s.path}`, "", s.text);
+  out.push("", `<!-- 本层：${shards.length} 片 / ${chars} 字符${budget > 0 ? ` · 上限 ${budget}` : " · 不限制"} -->`);
   return out.join("\n");
 }
 
@@ -769,7 +776,8 @@ function renderProjectDir(cwd, dir) {
   const orphans = others.filter((f) => !refs.has(f.name));
   const entries = (indexText.match(/^\s*-\s*\[/gm) ?? []).length;
   const parts = [
-    `<!-- 项目记忆 · ${cwd} · 目录形式：索引 ${entries} 条 / 正文 ${others.length} 篇，正文按需 read -->`,
+    // 头行不放「索引 N 条 / 正文 M 篇」—— 那两个数字随写入变，放头行会毁掉整个前缀（理由同 renderMap）。
+    `<!-- 项目记忆 · ${cwd} · 目录形式（人写的索引整篇注入，正文按需 read） -->`,
   ];
   if (indexText) {
     parts.push("", `## 索引 (MEMORY.md) → ${indexPath}`, "", clamp(indexText, indexPath));
@@ -779,6 +787,7 @@ function renderProjectDir(cwd, dir) {
     for (const f of orphans) parts.push(`- ${f.name} (${(f.size / 1000).toFixed(1)}k)`);
   }
   parts.push("", `<!-- 写入本层：正文写进对应主题文件，并在 MEMORY.md 补一行 \`- [标题](文件.md) — 摘要\` -->`);
+  parts.push("", `<!-- 本层：索引 ${entries} 条 / 正文 ${others.length} 篇 -->`);
   return parts.join("\n");
 }
 

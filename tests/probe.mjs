@@ -180,13 +180,20 @@ const probeShard = (name, n) => {
 writeFileSync(join(TOPICS, "probe-shard-2.md"), probeShard("探针分片二", 40));
 writeFileSync(join(TOPICS, "probe-shard-3.md"), probeShard("探针分片三", 40));
 store.injectMode = "full";
-check(at(CWD).includes("全文注入：3 片"), "full: 多片且总量在预算内 → 逐片整篇注入（头注释标明片数）");
+check(
+  at(CWD).includes("全文注入。") && at(CWD).includes("<!-- 本层：3 片"),
+  "full: 多片且总量在预算内 → 逐片整篇注入（片数统计挪到段尾）",
+);
 store.maxChars = 1200;
 check(at(CWD).includes("自动回退索引模式"), "full: 分片总量超上限 → 自动回退索引并说明原因");
 store.maxChars = 24000;
 store.injectMode = "index";
 store.indexBudget = 1200;
 const tight = at(CWD);
+check(
+  !/索引模式：\d+ 片/.test(tight) && tight.includes("<!-- 本层：3 片"),
+  "index: 头行不放动态统计（片数/条数/字符数挪到段尾）—— 否则写一条记忆就让 KV cache 前缀全失效",
+);
 check(tight.includes("关键词：探针关键词甲"), "budget: 片级关键词（首行注释 · 之后那段）进入索引");
 check(tight.includes("· 最新 2026-02-09"), "budget: 片级最新条目日期进入索引（新近度可见）");
 check(!tight.includes("未逐条列出"), "budget: 超预算时不再整层退化成「零标题」目录");
@@ -222,6 +229,11 @@ writeFileSync(join(TOPICS, "probe-map-shard.md"), probeShard("探针地图分片
 store.injectMode = "map";
 const mapped = at(CWD);
 check(mapped.includes("地图模式"), "map: 头注释标明地图模式");
+check(
+  !/地图模式：\d+ 片/.test(mapped) && mapped.includes("<!-- 本层："),
+  "map: 头行只留档位、片数/条数/字符数挪到段尾（防「写一条记忆就毁掉 KV cache 前缀」）",
+);
+check(mapped.includes("<!-- 本层：索引"), "project: 目录形态的统计（索引 N 条 / 正文 M 篇）同样在段尾");
 check(mapped.includes("grep pattern="), "map: 给出 grep 检索指引（命中行自带行号）");
 check(mapped.includes("## 探针地图分片 (20 条"), "map: 片级统计（片名 · 条数）仍在");
 check(mapped.includes("关键词：探针关键词甲"), "map: 片级关键词仍在（路由靠它）");
