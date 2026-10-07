@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/icon.svg" width="72" alt="dsh-memory icon">
+</div>
+
 # dsh-memory
 
 > Progressive long-term memory for **DeepSeek Harness (DSH)** — memory lives as sharded plain
