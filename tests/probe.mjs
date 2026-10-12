@@ -811,6 +811,14 @@ store.writeHookCommand = "";
   check(t3 && t3.reads.length === 1, "v0.8: 日志变短触发 reset 后按重放重建");
   const hit2 = host.toolMemoryHit("write", { file_path: `${HOME}/.dsh/memory/audit.log` });
   check(hit2 === null, "v0.8: plugin-internal（audit.log）不计活动");
+  const searchHit = host.toolMemoryHit("memory_search", { query: "x" });
+  check(searchHit && searchHit.kind === "search" && searchHit.label === "记忆检索", "v0.8: memory_search 记为检索活动（回合记忆栏可见）");
+  const evSearch = [
+    { type: "tool/call", seq: 1, time: 0, data: { turn: 2, step: 1, callId: "s1", name: "memory_search", arguments: JSON.stringify({ query: "x" }) } },
+    { type: "tool/result", seq: 2, time: 0, data: { turn: 2, step: 1, message: { source: { callId: "s1" } } } },
+  ];
+  const tSearch = host.projectMemoryActivity("sess-probe-search", mk(evSearch)).get(2);
+  check(tSearch && tSearch.reads.length === 1 && tSearch.reads[0].label === "记忆检索" && tSearch.reads[0].tool === "memory_search", "v0.8: memory_search 进投影 reads 且 label 直达");
 
   // 软注入的服务必须从【回调参数】取（v0.8 首发 bug：外层 ctx.tools 在真实宿主是
   // undefined → 注册静默失败）。替身把服务放 cb 参数上，断言 register 真被调到。

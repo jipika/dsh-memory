@@ -1984,6 +1984,11 @@ const activityStates = new Map();
  */
 function toolMemoryHit(name, args) {
   if (!args || typeof args !== "object") return null;
+  // 自家检索工具：无单一文件 path，整轮记一条「记忆检索」（活动栏可见，不进文件明细）。
+  // layer 现阶段记忆根只有全局/项目两层由检索结果各自携带，活动条目统一记 global 层。
+  if (name === "memory_search") {
+    return { path: `${HOME}/.dsh/memory`, kind: "search", layer: "global", label: "记忆检索" };
+  }
   if (name === "read" || name === "write" || name === "edit") {
     const hit = memoryTargetOf(args.file_path);
     if (!hit || hit.kind === "plugin-internal" || hit.kind === "other") return null;
@@ -2046,7 +2051,8 @@ function consumeActivityEvent(state, event) {
   const entry = {
     tool: call.name,
     path: call.hit.path,
-    label: activityLabel(call.hit.path),
+    // label 覆盖仅限 memory_search 分支（hit.label 只在那儿有），其余路径走文件名推导
+    label: call.hit.label ?? activityLabel(call.hit.path),
     kind: call.hit.kind,
     layer: call.hit.layer,
     ...(call.hit.offset !== undefined ? { offset: call.hit.offset } : {}),
