@@ -2131,7 +2131,11 @@ async function handleRoute(req, res) {
  */
 export function apply(ctx) {
   // 路由侧要按 sessionId 取 agent.session —— 存模块级引用（handleActivity 用）。
-  HOST_CTX = ctx;
+  // agents 服务同样经软注入拿【回调参数视图】（deepseek-account 的 scope.agents 同款）；
+  // 外层 ctx 上 agents 可能不可见。视图同时保留 effect/on 等能力（回调整个 ctx 传形）。
+  ctx.inject(["agents"], (agentsCtx) => {
+    HOST_CTX = agentsCtx;
+  });
   ctx.effect(
     () =>
       ctx.systemPrompt.section({
@@ -2167,11 +2171,14 @@ export function apply(ctx) {
   });
 
   // memory_search 工具：词法检索长期记忆（中文 bigram + 加权排序 + 覆盖度门槛）。
-  // tools 服务缺席（老宿主/替身）时静默跳过，不影响其余功能。
-  ctx.inject(["tools"], () => {
+  // 服务挂【注入回调的参数】上，不是外层 ctx —— 宿主通行模式（agent-default-model 的
+  // child.settings、agent-tool-presentation 的 runtimeCtx.tools 都从回调参数取）；
+  // 用外层 ctx.tools 在真实宿主是 undefined，注册静默失败（v0.8 首发实测踩的坑）。
+  // tools 服务缺席（老宿主）时软注入直接跳过，不影响其余功能。
+  ctx.inject(["tools"], (toolCtx) => {
     ctx.effect(
       () =>
-        ctx.tools.register({
+        toolCtx.tools.register({
           name: "memory_search",
           description:
             "在长期记忆（全局分片 + 项目记忆）中按相关度检索条目。中文自动 bigram 切分、字段加权、覆盖度过滤，返回排序后的条目及其文件行号。" +

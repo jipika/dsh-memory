@@ -111,12 +111,22 @@ const store = new Proxy(
   },
 );
 writeFileSync(join(HOME, ".dsh/memory/settings.json"), `${JSON.stringify(store)}\n`);
+const registeredTools = [];
+const fakeAgent = { session: { snapshotEvents: () => [] } };
+const fakeAgents = {
+  get: (id) => (id === "sess-probe-agent" ? fakeAgent : undefined),
+  list: () => [fakeAgent],
+  roots: () => [fakeAgent],
+};
 host.apply({
   effect: (fn) => fn(),
   on: (event, handler) => { mountedHooks[event] = handler; return () => {}; },
   systemPrompt: { section: (s) => { sections.push(s); return () => {}; } },
   inject: (deps, cb) => {
+    // 服务挂【回调参数】上 —— 复制真实宿主语义（ctx.inject(["webServer"], (wctx) => …)）
     if (deps.includes("webServer")) cb({ webServer: { register: (r) => { routes.push(r); return () => {}; } } });
+    if (deps.includes("tools")) cb({ tools: { register: (d) => { registeredTools.push(d); return () => {}; } } });
+    if (deps.includes("agents")) cb({ agents: fakeAgents, effect: (fn) => fn(), on: () => () => {} });
   },
 });
 
@@ -801,6 +811,23 @@ store.writeHookCommand = "";
   check(t3 && t3.reads.length === 1, "v0.8: 日志变短触发 reset 后按重放重建");
   const hit2 = host.toolMemoryHit("write", { file_path: `${HOME}/.dsh/memory/audit.log` });
   check(hit2 === null, "v0.8: plugin-internal（audit.log）不计活动");
+
+  // 软注入的服务必须从【回调参数】取（v0.8 首发 bug：外层 ctx.tools 在真实宿主是
+  // undefined → 注册静默失败）。替身把服务放 cb 参数上，断言 register 真被调到。
+  check(registeredTools.length === 1 && registeredTools[0].name === "memory_search", `v0.8: memory_search 经软注入注册（实际 ${registeredTools.map((t) => t.name).join(",") || "无"}）`);
+  check(typeof registeredTools[0]?.execute === "function" && typeof registeredTools[0]?.output?.render === "function", "v0.8: 工具带 execute 与 output.render");
+  // agents 软注入视图：handleActivity 按它取 agent.session —— 用 fakeAgents 走一遍
+  const actJson = await new Promise((resolve) => {
+    const fakeRes = {
+      code: 0,
+      end: function (body) { resolve({ code: this.code, body }); },
+      writeHead: function (code) { this.code = code; return this; },
+      setHeader: function () { return this; },
+    };
+    const url = new URL("http://localhost/dsh-memory/activity?sessionId=sess-probe-agent&turn=9");
+    host.handleActivity({ url: url.pathname + url.search }, fakeRes, url);
+  });
+  check(actJson.code === 200 && JSON.parse(actJson.body).ok === true, "v0.8: handleActivity 走软注入的 agents 视图返回 200");
 }
 
 console.log("dsh-memory probe — two-layer memory + rules, viewable & editable");
