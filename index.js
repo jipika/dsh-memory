@@ -132,9 +132,20 @@ const FILE_RE = /^[A-Za-z0-9\u4e00-\u9fff._ -]+\.md$/;
 export const name = "dsh-memory";
 export const inject = ["systemPrompt"];
 
+/** 插件宿主上下文（apply 时赋值）：handleActivity 按 sessionId 取 agent.session 用。 */
+let HOST_CTX = null;
+
 // 钩子子系统的纯函数与处理器：导出仅供 tests/probe.mjs 直测（host 半边自包含，无副作用）。
 export {
   memoryTargetOf,
+  lexicalSearchTokens,
+  lexicalRequiredMatchCount,
+  entryRows,
+  searchMemory,
+  formatSearchResults,
+  toolMemoryHit,
+  projectMemoryActivity,
+  handleActivity,
   extractEntries,
   validEntryDate,
   lineDiff,
@@ -197,6 +208,8 @@ function normalizeSettings(value) {
     discipline: v.discipline !== false,
     injectHookCommand: typeof v.injectHookCommand === "string" ? v.injectHookCommand : "",
     audit: v.audit !== false,
+    // 回合记忆栏（client 半边的 conversation.chat.turnTail 插槽），关掉只是不显示
+    turnTail: v.turnTail !== false,
   };
 }
 
@@ -567,6 +580,181 @@ function collectShards(files) {
 /** 一层的条目总数（地图模式据此决定「逐条内联」还是「只给地图」）。 */
 function layerEntryTotal(files) {
   return collectShards(files).reduce((n, s) => n + s.entries.length, 0);
+}
+
+// ── memory_search：词法检索器（v0.8，借鉴 dsh-mnemon 的 lexical 检索层）────────
+// 与裸 grep 的差别：NFKC 归一化、中文 bigram 切分（"插件开发"→插件/件开/开发）、
+// 字段加权（片名>关键词>条目）、token 覆盖度门槛（query 足够聚焦后才要求更广覆盖）、
+// 相关度排序。纯同步文件扫描，百片量级毫秒级，无索引、无依赖。
+
+/**
+ * 检索词切分：中文段按相邻两字滑窗（bigram），西文按词（≥2 字符），去重限量。
+ * 移植自 dsh-mnemon 的 search-tokens.ts（MIT）。
+ * @param {string} value - 原始查询串。
+ * @param {number} [maximum=64] - token 上限。
+ * @returns {string[]} token 列表。
+ */
+function lexicalSearchTokens(value, maximum = 64) {
+  const normalized = String(value ?? "").normalize("NFKC").toLocaleLowerCase();
+  const tokens = [];
+  for (const segment of normalized.split(/(\p{Script=Han}+)/u)) {
+    if (/^\p{Script=Han}+$/u.test(segment)) {
+      const chars = [...segment];
+      if (chars.length <= 2) tokens.push(segment);
+      else for (let i = 0; i < chars.length - 1; i++) tokens.push(chars[i] + chars[i + 1]);
+      continue;
+    }
+    tokens.push(...(segment.match(/[\p{L}\p{N}_-]+/gu) ?? []).filter((t) => t.length >= 2));
+  }
+  return [...new Set(tokens)].slice(0, maximum);
+}
+
+/**
+ * 覆盖度门槛：query 切出的 token 少于 4 个只要求命中 1 个；≥4 个要求命中 ⌈n/4⌉（至少 2）。
+ * 「query 足够聚焦后才要求更广覆盖」——防宽泛 query 整库乱命中。
+ * @param {string[]} tokens - 切分结果。
+ * @returns {number} 至少要命中的 token 数（0 = 无门槛，靠整句命中）。
+ */
+function lexicalRequiredMatchCount(tokens) {
+  if (tokens.length === 0) return 0;
+  if (tokens.length < 4) return 1;
+  return Math.max(2, Math.ceil(tokens.length / 4));
+}
+
+/**
+ * 条目行遍历（带续行合并）：`- ` 开行起一条，后续非空/非标题/非新条目的行并入。
+ * 行号语义与 parseEntries 一致（1 起，开行号；``` 围栏内容并入所在条目不切分）。
+ * @param {string} text - 分片正文。
+ * @returns {{line:number,text:string}[]} 条目列表。
+ */
+function entryRows(text) {
+  const lines = String(text).split("\n");
+  const out = [];
+  let fence = false;
+  let current = null;
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (/^\s*```/.test(ln)) {
+      fence = !fence;
+      if (current) current.text += `\n${ln}`;
+      continue;
+    }
+    if (fence) {
+      if (current) current.text += `\n${ln}`;
+      continue;
+    }
+    if (/^##\s+/.test(ln) || ln.trim() === "") {
+      current = null;
+      continue;
+    }
+    if (/^\s*-\s+\S/.test(ln)) {
+      current = { line: i + 1, text: ln };
+      out.push(current);
+      continue;
+    }
+    if (current) current.text += `\n${ln}`;
+  }
+  return out;
+}
+
+/**
+ * 全库检索：全局层 + 项目层，条目级打分排序。
+ * 打分：整句命中 片名+12 / 关键词+7 / 条目+4；每 token 命中 片名+4 / 关键词+2 / 条目+1；
+ * 覆盖度不足或零分的条目剔除；同分按条目内日期新者优先。
+ * @param {string} query - 查询串。
+ * @param {{limit?:number}} [options] - limit 默认 8，上限 20。
+ * @returns {{ok:true,query:string,results:object[],scanned:{files:number,entries:number},totalHits:number}|{ok:false,error:string}}
+ */
+function searchMemory(query, options = {}) {
+  const raw = String(query ?? "").trim();
+  if (raw === "") return { ok: false, error: "query is required" };
+  const limit = Math.max(1, Math.min(20, Math.trunc(options.limit ?? 8)));
+  const normalized = raw.normalize("NFKC").toLocaleLowerCase();
+  const tokens = lexicalSearchTokens(normalized);
+  const required = lexicalRequiredMatchCount(tokens);
+
+  const files = [];
+  for (const f of layerFiles(TOPICS_DIR, GLOBAL_MEMORY)) files.push({ ...f, layer: "global" });
+  // 注：layerFiles 在分片目录存在时不再回落单文件 memory.md（注入层的语义）；
+  // 但检索的目标是「全部用户记忆」，memory.md 里有内容就应当参与 —— 单独补上。
+  if (existsSync(GLOBAL_MEMORY) && !files.some((f) => f.path === GLOBAL_MEMORY)) {
+    files.push({ name: "memory.md", path: GLOBAL_MEMORY, layer: "global" });
+  }
+  for (const slug of listProjectSlugs()) {
+    const dir = `${PROJECT_DIR}/${slug}`;
+    const single = `${PROJECT_DIR}/${slug}.md`;
+    if (isDir(dir)) {
+      for (const f of layerFiles(dir, "")) files.push({ ...f, layer: `project:${slug}` });
+    } else if (existsSync(single)) {
+      files.push({ name: slug, path: single, layer: `project:${slug}` });
+    }
+  }
+
+  const results = [];
+  let scannedEntries = 0;
+  for (const f of files) {
+    const text = readOrEmpty(f.path);
+    if (!text.trim()) continue;
+    const name = shardName(text, f.name);
+    const keywords = shardKeywords(text, name);
+    const nName = name.normalize("NFKC").toLocaleLowerCase();
+    const nKeywords = keywords.normalize("NFKC").toLocaleLowerCase();
+    const phraseShard = nName.includes(normalized) ? 12 : nKeywords.includes(normalized) ? 7 : 0;
+    const hitTokens = new Set();
+    for (const t of tokens) {
+      if (nName.includes(t) || nKeywords.includes(t)) hitTokens.add(t);
+    }
+    for (const entry of entryRows(text)) {
+      scannedEntries += 1;
+      const nEntry = entry.text.normalize("NFKC").toLocaleLowerCase();
+      let score = phraseShard;
+      if (nEntry.includes(normalized)) score += 4;
+      for (const t of tokens) {
+        if (nName.includes(t)) score += 4;
+        else if (nKeywords.includes(t)) score += 2;
+        if (nEntry.includes(t)) {
+          score += 1;
+          hitTokens.add(t);
+        }
+      }
+      const covered = tokens.length === 0 ? score > 0 || nEntry.includes(normalized) : hitTokens.size >= required;
+      if (score <= 0 || !covered) continue;
+      const date = (entry.text.match(/\[(\d{4}-\d{2}-\d{2})\]/) ?? [])[1] ?? "";
+      results.push({
+        path: f.path,
+        shard: name,
+        layer: f.layer,
+        line: entry.line,
+        date,
+        score,
+        text: entry.text.replace(/\s+/g, " ").slice(0, 240),
+      });
+    }
+  }
+  results.sort((a, b) => b.score - a.score || (b.date || "").localeCompare(a.date || "") || a.line - b.line);
+  return {
+    ok: true,
+    query: raw,
+    results: results.slice(0, limit),
+    scanned: { files: files.length, entries: scannedEntries },
+    totalHits: results.length,
+  };
+}
+
+/** 把检索结果渲染成模型可读文本（工具 output.render 用）。 */
+function formatSearchResults(value) {
+  if (!value || value.ok !== true) return `memory_search 失败：${value?.error ?? "unknown"}`;
+  if (value.results.length === 0) {
+    return `memory_search：无命中（扫描 ${value.scanned.files} 个文件 / ${value.scanned.entries} 条条目）。换关键词重试，或用 grep 做精确正则。`;
+  }
+  const rows = value.results.map(
+    (r, i) => `${i + 1}. [score ${r.score}] ${r.path}:${r.line}${r.date ? ` [${r.date}]` : ""}\n   ${r.text}`,
+  );
+  return [
+    `memory_search：共 ${value.totalHits} 条命中（显示前 ${value.results.length} 条；扫描 ${value.scanned.files} 文件 / ${value.scanned.entries} 条目），按相关度排序。`,
+    ...rows,
+    "→ read 对应文件的行号取上下文；条目行号即记忆纪律里的 L 号。",
+  ].join("\n");
 }
 
 /** 片级统计行（两个渲染器共用）：片名 · 条数 · 体量 · 最新日期 · 路径。 */
@@ -1585,11 +1773,11 @@ async function postExecuteHook(exec, result, next) {
  */
 const DISCIPLINE_HEAD = {
   map: [
-    "     · 【开工先查】非琐碎任务开头先取线索：拿任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）去 grep 记忆目录 —— 全局为 `~/.dsh/memory/topics`，项目层路径见下面各片段；命中片名 / 行号再动手，没命中就不读，别整库通读。（片段里**已经逐条内联**的层不用再 grep：直接按行号 `read` 即可；标着「地图模式」的层才需要先 grep）",
+    "     · 【开工先查】非琐碎任务开头先取线索：拿任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）优先用 `memory_search` 工具查记忆（中文自动切分 + 相关度排序，工具表里有就用）；没有该工具再去 grep 记忆目录 —— 全局为 `~/.dsh/memory/topics`，项目层路径见下面各片段；命中片名 / 行号再动手，没命中就不读，别整库通读。（片段里**已经逐条内联**的层不用再检索：直接按行号 `read` 即可；标着「地图模式」的层才需要先查）",
     "     · 【读法】命中行自带行号 → `read path=<片路径> offset=<行号> limit=<要几条>`；片名与关键词只说明主题、不保证内容，禁止凭片名臆测",
   ],
   index: [
-    "     · 【开工先查】非琐碎任务开头先扫上面的索引：用任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）去匹配片名与「关键词」行，命中就 read 该片对应行号再动手；没命中就不读，别整库通读",
+    "     · 【开工先查】非琐碎任务开头先扫上面的索引：用任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）优先用 `memory_search` 工具（相关度排序，工具表里有就用），没有就去匹配片名与「关键词」行；命中就 read 该片对应行号再动手；没命中就不读，别整库通读",
     "     · 【读法】按行号精确 read（offset = 条目行号），禁止凭片名或标题臆测内容；某片只列了最新几条时，按提示的行号区间读更早的条目",
   ],
   full: [
@@ -1778,6 +1966,141 @@ async function handleSettings(req, res) {
   return sendJson(res, 200, { ok: true, value: updateSettings(patch), projects: knownProjects() });
 }
 
+// ── 回合记忆活动投影（v0.8，借鉴 dsh-mnemon 的 TurnActivityProjection）────────
+// 数据源是 session 持久日志（agent.session.snapshotEvents()），请求时增量消费——
+// 不挂事件监听、不需要 per-agent 安装，对插件激活前就存在的会话同样生效。
+// 识别 read/grep/glob/write/edit/bash 中命中记忆管辖路径的调用，按 (sessionId, turn) 聚合。
+
+/** 每会话保留的回合数上限（环形裁剪最旧 turn）。 */
+const ACTIVITY_TURN_KEEP = 50;
+/** sessionId → {eventCount, lastEventSeq, byTurn: Map<turn, activity>, pending: Map<callId, call>} */
+const activityStates = new Map();
+
+/**
+ * 判定一次工具调用是否触及记忆管辖路径。
+ * @param {string} name - 工具名。
+ * @param {object} args - 已解析的调用参数。
+ * @returns {{path:string,kind:string,layer:string,offset?:number}|null} 命中信息；null = 与记忆无关。
+ */
+function toolMemoryHit(name, args) {
+  if (!args || typeof args !== "object") return null;
+  if (name === "read" || name === "write" || name === "edit") {
+    const hit = memoryTargetOf(args.file_path);
+    if (!hit || hit.kind === "plugin-internal" || hit.kind === "other") return null;
+    return {
+      path: args.file_path,
+      kind: hit.kind,
+      layer: hit.layer,
+      ...(typeof args.offset === "number" ? { offset: args.offset } : {}),
+    };
+  }
+  if (name === "grep" || name === "glob") {
+    // grep/glob 的 path 常常是目录（如 …/topics）——memoryTargetOf 会归为 "other"，
+    // 对这两个工具它是合法且最常见的形态，放行；只挡 plugin-internal（audit.log/.bak）。
+    const hit = memoryTargetOf(args.path);
+    if (!hit || hit.kind === "plugin-internal") return null;
+    return { path: args.path, kind: hit.kind === "other" ? "topics-dir" : hit.kind, layer: hit.layer };
+  }
+  if (name === "bash" && typeof args.command === "string" && args.command.includes(".dsh/memory")) {
+    return { path: `${HOME}/.dsh/memory`, kind: "other", layer: "global" };
+  }
+  return null;
+}
+
+/** 文件路径 → 展示名（点击打开用的短标签）。 */
+function activityLabel(path) {
+  const base = String(path ?? "").split("/").pop() ?? "";
+  return base.replace(/\.md$/, "") || base;
+}
+
+/** 单个事件消费：tool/call 记 pending，tool/result 落账（失败不计入 reads/writes）。 */
+function consumeActivityEvent(state, event) {
+  if (event.type === "tool/call") {
+    const data = event.data ?? {};
+    const { turn, callId, name } = data;
+    if (typeof turn !== "number" || typeof callId !== "string" || typeof name !== "string") return;
+    let args = data.arguments;
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = undefined;
+      }
+    }
+    const hit = toolMemoryHit(name, args);
+    if (hit) state.pending.set(callId, { turn, name, hit });
+    return;
+  }
+  if (event.type !== "tool/result") return;
+  const callId = event.data?.message?.source?.callId;
+  if (typeof callId !== "string") return;
+  const call = state.pending.get(callId);
+  if (call === undefined) return;
+  state.pending.delete(callId);
+  if (event.data.error !== undefined) return; // deny/失败不计入活动
+  let activity = state.byTurn.get(call.turn);
+  if (activity === undefined) {
+    activity = { turn: call.turn, reads: [], writes: [] };
+    state.byTurn.set(call.turn, activity);
+  }
+  const entry = {
+    tool: call.name,
+    path: call.hit.path,
+    label: activityLabel(call.hit.path),
+    kind: call.hit.kind,
+    layer: call.hit.layer,
+    ...(call.hit.offset !== undefined ? { offset: call.hit.offset } : {}),
+  };
+  (call.name === "write" || call.name === "edit" ? activity.writes : activity.reads).push(entry);
+}
+
+/**
+ * 增量投影某会话的记忆活动（照 mnemon 的游标语义：事件变短或尾 seq 变化即 reset）。
+ * @param {string} sessionId - 会话 ID。
+ * @param {{snapshotEvents:Function}} session - 会话对象（宿主 agent.session）。
+ * @returns {Map<number,{turn:number,reads:object[],writes:object[]}>} turn → 活动。
+ */
+function projectMemoryActivity(sessionId, session) {
+  let state = activityStates.get(sessionId);
+  if (state === undefined) {
+    state = { eventCount: 0, lastEventSeq: undefined, byTurn: new Map(), pending: new Map() };
+    activityStates.set(sessionId, state);
+  }
+  const events = session.snapshotEvents();
+  const lastSeq = events.at(-1)?.seq;
+  if (events.length < state.eventCount || (events.length === state.eventCount && state.lastEventSeq !== lastSeq)) {
+    state.eventCount = 0;
+    state.lastEventSeq = undefined;
+    state.byTurn.clear();
+    state.pending.clear();
+  }
+  for (let i = state.eventCount; i < events.length; i++) consumeActivityEvent(state, events[i]);
+  state.eventCount = events.length;
+  state.lastEventSeq = typeof lastSeq === "number" ? lastSeq : undefined;
+  if (state.byTurn.size > ACTIVITY_TURN_KEEP) {
+    const turns = [...state.byTurn.keys()].sort((a, b) => a - b);
+    for (const t of turns.slice(0, state.byTurn.size - ACTIVITY_TURN_KEEP)) state.byTurn.delete(t);
+  }
+  return state.byTurn;
+}
+
+/**
+ * `GET /dsh-memory/activity?sessionId=…&turn=N`：某会话某回合的记忆活动。
+ * turn 缺省时返回该会话全部已投影回合（调试用）。
+ */
+function handleActivity(req, res, url) {
+  const sessionId = String(url.searchParams.get("sessionId") ?? "").trim();
+  const turnParam = String(url.searchParams.get("turn") ?? "").trim();
+  const turn = /^\d+$/.test(turnParam) ? Number(turnParam) : null;
+  const agent = sessionId !== "" && HOST_CTX?.agents ? HOST_CTX.agents.get(sessionId) : undefined;
+  if (!agent?.session) return sendJson(res, 200, { ok: true, activity: null });
+  const byTurn = projectMemoryActivity(sessionId, agent.session);
+  if (turn === null) {
+    return sendJson(res, 200, { ok: true, activities: [...byTurn.values()] });
+  }
+  return sendJson(res, 200, { ok: true, activity: byTurn.get(turn) ?? null });
+}
+
 /**
  * 路由入口：`/dsh-memory/content`、`/dsh-memory/write` 与 `/dsh-memory/settings`。
  * @param {import("node:http").IncomingMessage} req - 请求。
@@ -1791,6 +2114,7 @@ async function handleRoute(req, res) {
 
     if (url.pathname === "/dsh-memory/content") return handleContent(req, res);
     if (url.pathname === "/dsh-memory/settings") return await handleSettings(req, res);
+    if (url.pathname === "/dsh-memory/activity") return handleActivity(req, res, url);
     if (url.pathname === "/dsh-memory/write") {
       if (method !== "POST") return sendJson(res, 405, { ok: false, error: "use POST" });
       return await handleWrite(req, res);
@@ -1806,11 +2130,13 @@ async function handleRoute(req, res) {
  * @param {object} ctx - cordis 插件上下文。
  */
 export function apply(ctx) {
+  // 路由侧要按 sessionId 取 agent.session —— 存模块级引用（handleActivity 用）。
+  HOST_CTX = ctx;
   ctx.effect(
     () =>
       ctx.systemPrompt.section({
         name: "dsh-memory:long-term",
-        order: 1, // 紧跟 DEPLOYMENT_PERSONA_PREFIX(order 0)，先于工具规范
+        order: 9500, // 靠后（DELIVERABLE_FILE_REFERENCES 9000 与 STRUCTURED_OUTPUT 9900 之间的空档）：记忆段是函数式注入，写一条记忆就使该段之后的前缀缓存全部作废——位置越靠后，缓存失效面越小（原 order 1 时失效面=整个系统提示词+全部消息历史）；「开工先查」的注意力由 AGENTS.md 与注入块尾部的纪律注释兜底
         text: compose,
       }),
     "dsh-memory: long-term memory section",
@@ -1837,6 +2163,37 @@ export function apply(ctx) {
           handler: handleRoute,
         }),
       "dsh-memory: content route",
+    );
+  });
+
+  // memory_search 工具：词法检索长期记忆（中文 bigram + 加权排序 + 覆盖度门槛）。
+  // tools 服务缺席（老宿主/替身）时静默跳过，不影响其余功能。
+  ctx.inject(["tools"], () => {
+    ctx.effect(
+      () =>
+        ctx.tools.register({
+          name: "memory_search",
+          description:
+            "在长期记忆（全局分片 + 项目记忆）中按相关度检索条目。中文自动 bigram 切分、字段加权、覆盖度过滤，返回排序后的条目及其文件行号。" +
+            "开工取线索、找「以前记过的 X」、关键词模糊命中时优先用它；需要精确正则、按路径限定范围或回读已知文件时再用 grep/read。",
+          parameters: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "检索词（中文/英文/混合，越具体越好）" },
+              limit: { type: "integer", description: "返回条数上限，默认 8，最大 20" },
+            },
+            required: ["query"],
+          },
+          output: {
+            schema: { type: "object", additionalProperties: true },
+            render: (_args, value) => [{ type: "text", text: formatSearchResults(value) }],
+          },
+          execute: async (args) => {
+            const limit = Number.isFinite(args?.limit) ? args.limit : undefined;
+            return searchMemory(String(args?.query ?? ""), { limit });
+          },
+        }),
+      "dsh-memory: memory_search tool",
     );
   });
 }

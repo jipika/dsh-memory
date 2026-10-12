@@ -68,6 +68,21 @@
           ".dm-hookrow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 0}",
           ".dm-hookrow-label{font-size:12px;line-height:17px;color:var(--dsw-alias-label-primary)}",
           ".dm-hookrow-sub{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}",
+          // 回合记忆栏（conversation.chat.turnTail 插槽）
+          ".dm-turntail{margin:8px 0 2px}",
+          ".dm-turntail-bar{display:inline-flex;align-items:center;gap:8px;padding:4px 12px;border:.5px solid var(--dsw-alias-border-l3);border-radius:999px;background:transparent;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;cursor:pointer}",
+          ".dm-turntail-bar:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}",
+          ".dm-turntail-mark{font-weight:500;color:var(--dsw-alias-label-secondary)}",
+          ".dm-turntail-metric{font-size:11px;line-height:16px}",
+          ".dm-turntail-metric-write{color:var(--dsw-alias-brand-primary)}",
+          ".dm-turntail-caret{font-size:10px;transition:transform 120ms ease;display:inline-block}",
+          ".dm-turntail-caret-open{transform:rotate(180deg)}",
+          ".dm-turntail-list{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}",
+          ".dm-turntail-item{display:flex;align-items:baseline;gap:8px;width:100%;padding:4px 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:6px;background:transparent;text-align:left;cursor:pointer}",
+          ".dm-turntail-item:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+          ".dm-turntail-tag{flex:none;font-size:10px;line-height:14px;padding:1px 6px;border-radius:4px;border:.5px solid var(--dsw-alias-border-l3);color:var(--dsw-alias-label-tertiary)}",
+          ".dm-turntail-file{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+          ".dm-turntail-sub{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary)}",
         ].join("");
 
         function ensureStyleSheet() {
@@ -94,6 +109,7 @@
             discipline: true,
             injectHookCommand: "",
             audit: true,
+            turnTail: true,
           };
           var state = { value: DEFAULT_VALUE, projects: [], status: "loading", writable: true };
           var listeners = new Set();
@@ -123,6 +139,7 @@
                 discipline: v.discipline !== false,
                 injectHookCommand: typeof v.injectHookCommand === "string" ? v.injectHookCommand : "",
                 audit: v.audit !== false,
+                turnTail: v.turnTail !== false,
               },
               projects: Array.isArray(projects) ? projects : state.projects,
               status: "ready",
@@ -252,6 +269,7 @@
           var disciplineValue = value.discipline !== false;
           var readReminderValue = value.readReminder !== false;
           var auditValue = value.audit !== false;
+          var turnTailValue = value.turnTail !== false;
           var writeHookCommandValue = typeof value.writeHookCommand === "string" ? value.writeHookCommand : "";
           var injectHookCommandValue = typeof value.injectHookCommand === "string" ? value.injectHookCommand : "";
 
@@ -795,6 +813,21 @@
               ),
               react.createElement(
                 "div",
+                { className: "dm-hookrow" },
+                react.createElement(
+                  "div",
+                  null,
+                  react.createElement("div", { className: "dm-hookrow-label" }, "回合记忆栏"),
+                  react.createElement("div", { className: "dm-hookrow-sub" }, "在每条回复底部显示这一轮实际读取/写入了哪些记忆文件，点击直达原文"),
+                ),
+                react.createElement(Toggle, {
+                  checked: turnTailValue,
+                  label: "回合记忆栏",
+                  onToggle: function () { return setting.set("turnTail", !turnTailValue); },
+                }),
+              ),
+              react.createElement(
+                "div",
                 { className: "dm-chips" },
                 react.createElement("span", { className: "dm-limit-desc" }, "注入过滤命令（可选；stdin 进注入文本、stdout 出过滤结果，失败回落原文）"),
                 react.createElement("input", {
@@ -815,6 +848,99 @@
           );
         }
 
+        /** 回合记忆栏：本回合读/写了哪些记忆文件（数据来自 host 的 /dsh-memory/activity）。
+            挂在 DSH 的 conversation.chat.turnTail 插槽；owner 传 {turn, seq, openFile}，
+            slot inject 传 sessionId。turn 未关闭、无活动、或开关关闭时都不渲染。 */
+        function TurnTailBar(props) {
+          var snap = react.useSyncExternalStore(setting.store.subscribe, setting.store.getSnapshot, setting.store.getSnapshot);
+          var openPair = react.useState(false);
+          var open = openPair[0];
+          var setOpen = openPair[1];
+          var actPair = react.useState(undefined); // undefined = 拉取中，null = 无活动
+          var activity = actPair[0];
+          var setActivity = actPair[1];
+          var turn = props.turn || null;
+          var closed = !!turn && turn.status === "closed";
+          var number = turn && typeof turn.turn === "number" ? turn.turn : null;
+
+          react.useEffect(function () {
+            setting.load(); // 预热开关（load 幂等：失败回落 unavailable，不影响渲染开关判断）
+          }, []);
+
+          react.useEffect(function () {
+            if (!closed || number === null) {
+              setActivity(null);
+              return undefined;
+            }
+            var alive = true;
+            setActivity(undefined);
+            var sid = props.sessionId ? "&sessionId=" + encodeURIComponent(props.sessionId) : "";
+            fetch("/dsh-memory/activity?turn=" + number + sid, { headers: { accept: "application/json" } })
+              .then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (alive) setActivity(d && d.ok && d.activity ? d.activity : null);
+              })
+              .catch(function () {
+                if (alive) setActivity(null);
+              });
+            return function () { alive = false; };
+          }, [closed, number, props.sessionId, props.seq]);
+
+          if (!setting.available() || snap.value.turnTail === false) return null;
+          if (!closed || number === null || !activity) return null;
+          var reads = Array.isArray(activity.reads) ? activity.reads : [];
+          var writes = Array.isArray(activity.writes) ? activity.writes : [];
+          if (reads.length === 0 && writes.length === 0) return null;
+
+          var rowOf = function (item, kind) {
+            return react.createElement(
+              "li",
+              { key: kind + ":" + item.tool + ":" + item.path + ":" + (item.offset ?? "") },
+              react.createElement(
+                "button",
+                {
+                  type: "button",
+                  className: "dm-turntail-item",
+                  title: item.path,
+                  onClick: function (event) {
+                    event.stopPropagation();
+                    if (typeof props.openFile === "function") props.openFile(item.path);
+                  },
+                },
+                react.createElement("span", { className: "dm-turntail-tag" }, kind),
+                react.createElement("span", { className: "dm-turntail-file" }, item.label),
+                item.offset !== undefined && react.createElement("span", { className: "dm-turntail-sub" }, "@L" + item.offset),
+              ),
+            );
+          };
+
+          return react.createElement(
+            "div",
+            { className: "dm-turntail" },
+            react.createElement(
+              "button",
+              {
+                type: "button",
+                className: "dm-turntail-bar",
+                "aria-expanded": open,
+                onClick: function () { return setOpen(!open); },
+              },
+              react.createElement("span", { className: "dm-turntail-mark" }, "记忆"),
+              react.createElement("span", null, "本回合记忆"),
+              reads.length > 0 && react.createElement("span", { className: "dm-turntail-metric" }, "读取 " + reads.length),
+              writes.length > 0 && react.createElement("span", { className: "dm-turntail-metric dm-turntail-metric-write" }, "写入 " + writes.length),
+              react.createElement("span", { className: "dm-turntail-caret" + (open ? " dm-turntail-caret-open" : "") }, "▾"),
+            ),
+            open &&
+              react.createElement(
+                "ul",
+                { className: "dm-turntail-list" },
+                reads.map(function (item) { return rowOf(item, "读取"); }),
+                writes.map(function (item) { return rowOf(item, "写入"); }),
+              ),
+          );
+        }
+
         function apply(ctx) {
           ensureStyleSheet();
           ctx.slots.inject("settings.section", () =>
@@ -823,7 +949,19 @@
               MemoryPane,
             ),
           );
+          // 回合记忆栏：挂 DSH 的 turnTail 插槽（owner props: turn/seq/openFile；inject 补 sessionId）。
+          ctx.slots.inject("conversation.chat.turnTail", () =>
+            ctx.slots.register(
+              {
+                name: "conversation.chat.turnTail",
+                id: "dsh-memory/turn-tail",
+                inject: (sessionId) => ({ sessionId }),
+              },
+              TurnTailBar,
+            ),
+          );
           // 开关值由 host 的 /dsh-memory/settings 路由提供，面板挂载时拉一次（见 MemoryPane 的 effect）。
+          setting.load().catch(() => {}); // 预热：回合记忆栏要用 turnTail 开关
         }
 
         exports.name = "dsh-memory";

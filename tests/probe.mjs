@@ -478,7 +478,8 @@ new Function(readFileSync(new URL("../client.js", import.meta.url), "utf8"))();
 const render = () => { reactMock.__reset(); return resolve(regs[0].C({})); };
 const buttons = (pane, label) => collect(pane, (n) => n.type === "button" && textOf(n) === label);
 
-check(regs.length === 1 && regs[0].o.name === "settings.section", "client: 注册 settings.section");
+check(regs.length === 2 && regs[0].o.name === "settings.section" && regs[1].o.name === "conversation.chat.turnTail", "client: 注册 settings.section + turnTail 两个插槽");
+check(regs[1].o.id === "dsh-memory/turn-tail" && typeof regs[1].o.inject === "function", "client: turnTail 插槽带 id 与 inject(sessionId)");
 check(regs[0]?.o.label === "记忆", "client: 导航标题 = 记忆");
 check(styleTags.length >= 1, "client: 样式表已注入");
 check(/\.dm-editor\{/.test(styleTags[0].textContent), "client: 样式表含编辑器样式");
@@ -523,7 +524,7 @@ check(chipTexts(pane).includes("6K") && buttons(pane, "12K").length === 1, "clie
 let rows = collect(pane, (n) => n.props?.className === "dm-row");
 check(rows.length === 3, `client: 三行（规则 / 全局 / 1 个项目），实际 ${rows.length}`);
 const switches = collect(pane, (n) => n.props?.role === "switch");
-check(switches.length === 5, `client: 每层一个开关 + 钩子区 3 个（纪律/读取提醒/审计），实际 ${switches.length}`);
+check(switches.length === 6, `client: 每层一个开关 + 钩子区 4 个（纪律/读取提醒/审计/回合记忆栏），实际 ${switches.length}`);
 check(strings.includes("写入 / 读取钩子") && strings.includes("写入守卫"), "client: 面板含「写入 / 读取钩子」区块");
 
 // ── 面板开关：读走 GET、写走 POST，闭环到 settings.json ─────────────────────
@@ -747,6 +748,60 @@ check(
 );
 store.writeGuard = "rules";
 store.writeHookCommand = "";
+
+
+// ══ v0.8：memory_search 词法检索器 + 回合记忆活动投影 ═══════════════════════
+{
+  // 词法切分：中文 bigram / 西文词 / 混合 / 去重 / 门槛
+  const bigram = host.lexicalSearchTokens("插件开发");
+  check(JSON.stringify(bigram) === JSON.stringify(["插件", "件开", "开发"]), `v0.8: 中文 bigram 切分 (${JSON.stringify(bigram)})`);
+  check(JSON.stringify(host.lexicalSearchTokens("turn-tail v0_8")) === JSON.stringify(["turn-tail", "v0_8"]), "v0.8: 西文词切分（含 -/_ 连写）");
+  const mixed = host.lexicalSearchTokens("dsh 记忆 v0.8");
+  check(mixed.includes("dsh") && mixed.includes("记忆") && !mixed.includes("v0.8"), "v0.8: 混合切分（单字符 v0.8 不成词）");
+  check(host.lexicalRequiredMatchCount(host.lexicalSearchTokens("记忆 索引")) === 1, "v0.8: 门槛 <4 tokens → 1");
+  check(host.lexicalRequiredMatchCount(host.lexicalSearchTokens("记忆 索引 注入 模式 预算 事故 缓存 KV")) === 2, "v0.8: 门槛 ≥4 tokens → ⌈n/4⌉ 至少 2");
+
+  // searchMemory：夹具（probe 顶部已造全局层 + 项目层；memory.md 此刻已是面板写入后的内容）
+  const hit = host.searchMemory("edited from panel");
+  check(hit.ok === true && hit.results.length > 0 && hit.results[0].path.endsWith("memory.md"), "v0.8: 检索命中全局单文件");
+  check(hit.results[0].line === 2, `v0.8: 全局条目行号正确 (${hit.results[0].line})`);
+  writeFileSync(join(TOPICS, "probe-v08-shard.md"), "# v08 shard\n- [2026-04-04] v08 searchable entry\n");
+  const shard = host.searchMemory("v08 searchable entry");
+  check(shard.results.some((r) => r.path.endsWith("probe-v08-shard.md") && r.line === 2), "v0.8: 检索命中 topics 分片");
+  const proj = host.searchMemory("probe project index entry");
+  check(proj.results.some((r) => r.path.includes(SLUG) && r.line === 1), "v0.8: 检索命中项目层索引行");
+  const none = host.searchMemory("zzz 完全不存在 qq");
+  check(none.ok === true && none.results.length === 0, "v0.8: 无命中返回空数组");
+  check(host.searchMemory("").ok === false, "v0.8: 空 query 拒绝");
+  const fmt = host.formatSearchResults(hit);
+  check(fmt.includes("read 对应文件的行号取上下文"), "v0.8: render 文本带读取指引");
+
+  // 回合记忆活动投影：read/grep 命中记账、deny 不计、非记忆路径不记、增量与 reset
+  const TOPIC = `${HOME}/.dsh/memory/topics/probe-shard.md`;
+  writeFileSync(TOPIC, "# probe shard\n- [2026-01-02] probe shard entry A\n");
+  const ev = [
+    { type: "tool/call", seq: 1, time: 0, data: { turn: 7, step: 1, callId: "p1", name: "read", arguments: JSON.stringify({ file_path: TOPIC, offset: 2 }) } },
+    { type: "tool/result", seq: 2, time: 0, data: { turn: 7, step: 1, message: { source: { callId: "p1" } } } },
+    { type: "tool/call", seq: 3, time: 0, data: { turn: 7, step: 1, callId: "p2", name: "edit", arguments: JSON.stringify({ file_path: TOPIC, old_string: "a", new_string: "b" }) } },
+    { type: "tool/result", seq: 4, time: 0, data: { turn: 7, step: 1, error: { name: "w", code: "deny" }, message: { source: { callId: "p2" } } } },
+    { type: "tool/call", seq: 5, time: 0, data: { turn: 7, step: 2, callId: "p3", name: "grep", arguments: JSON.stringify({ pattern: "probe", path: `${HOME}/.dsh/memory/topics` }) } },
+    { type: "tool/result", seq: 6, time: 0, data: { turn: 7, step: 2, message: { source: { callId: "p3" } } } },
+    { type: "tool/call", seq: 7, time: 0, data: { turn: 7, step: 2, callId: "p4", name: "read", arguments: JSON.stringify({ file_path: "/etc/hosts" }) } },
+    { type: "tool/result", seq: 8, time: 0, data: { turn: 7, step: 2, message: { source: { callId: "p4" } } } },
+  ];
+  const mk = (list) => ({ snapshotEvents: () => list });
+  const t1 = host.projectMemoryActivity("sess-probe-1", mk(ev)).get(7);
+  check(t1 && t1.reads.length === 2 && t1.reads[0].offset === 2, `v0.8: 投影 reads=2（read+grep，实际 ${t1?.reads.length}）`);
+  check(t1.reads.some((r) => r.tool === "grep" && r.kind === "topics-dir"), "v0.8: grep 目录 path 记为 topics-dir");
+  check(t1.writes.length === 0, "v0.8: deny 的写入不计入");
+  check(!t1.reads.some((r) => r.path === "/etc/hosts"), "v0.8: 非记忆路径不记");
+  const t2 = host.projectMemoryActivity("sess-probe-1", mk(ev)).get(7);
+  check(t2.reads.length === 2, "v0.8: 增量幂等（重投影不重复计数）");
+  const t3 = host.projectMemoryActivity("sess-probe-1", mk(ev.slice(0, 2))).get(7);
+  check(t3 && t3.reads.length === 1, "v0.8: 日志变短触发 reset 后按重放重建");
+  const hit2 = host.toolMemoryHit("write", { file_path: `${HOME}/.dsh/memory/audit.log` });
+  check(hit2 === null, "v0.8: plugin-internal（audit.log）不计活动");
+}
 
 console.log("dsh-memory probe — two-layer memory + rules, viewable & editable");
 console.log("─".repeat(72));
