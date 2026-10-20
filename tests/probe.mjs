@@ -4,12 +4,16 @@
  * 无需浏览器 / 网络 / API Key。
  */
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // ── 造一个隔离的 HOME（必须在 import 插件之前：插件的路径常量在模块加载时求值）──────
 const HOME = mkdtempSync(join(tmpdir(), "dsh-memory-probe-"));
 process.env.HOME = HOME;
+// dsh-card-summon 的状态目录同样指进临时 HOME（卡片记忆/召唤判定测试用）。
+const SUMMON_STATE = join(HOME, "card-summon-state");
+process.env.DSH_CARD_SUMMON_STATE = SUMMON_STATE;
 
 const SLUG = "--Users-probe-code-demo--";
 const SINGLE_SLUG = "--Users-probe-code-single--";
@@ -836,6 +840,253 @@ store.writeHookCommand = "";
     host.handleActivity({ url: url.pathname + url.search }, fakeRes, url);
   });
   check(actJson.code === 200 && JSON.parse(actJson.body).ok === true, "v0.8: handleActivity 走软注入的 agents 视图返回 200");
+}
+
+// ══ 卡片记忆层：召唤屏蔽 + 按卡写入 + 清除路由 ═══════════════════════════════
+{
+  const CARD_SLUG = "creator_probe-card-slug";
+  const CARD_PATH = `${HOME}/.dsh/memory/cards/${CARD_SLUG}.md`;
+  const SESSION = "sess-card-probe";
+  const castSession = "sess-cast-probe";
+
+  // 路由只有一条 prefix：/dsh-memory → handleRoute。假 req 携带可流式读的 body。
+  const route = routes.find((r) => r.path === "/dsh-memory");
+  check(route !== undefined && typeof route?.handler === "function", "card: /dsh-memory prefix 路由已注册");
+  const fakeRes = () => {
+    let code = 0;
+    let body = "";
+    const res = {
+      get code() { return code; },
+      get body() { return body; },
+      writeHead(c) { code = c; return this; },
+      setHeader: () => {},
+      end(b) { body = b ?? ""; return res; },
+    };
+    return res;
+  };
+  const callRoute = async (req, body) => {
+    const res = fakeRes();
+    const p = route.handler(req, res);
+    if (typeof body === "string") req.__emit?.(body);
+    await p;
+    return res;
+  };
+  const fakeReq = (over = {}) => {
+    const listeners = {};
+    const req = {
+      method: "GET",
+      url: "/dsh-memory/cards",
+      headers: {},
+      on(ev, cb) { listeners[ev] = cb; },
+      __emit(text) { listeners.data?.(Buffer.from(text)); listeners.end?.(); },
+      ...over,
+    };
+    return req;
+  };
+
+  // 无召唤状态：注入保持现状（topics 分片 + 项目层都在）
+  check(at(CWD).includes("全局记忆") && at(CWD).includes("probe project index entry"), "card: 无召唤记录 → 注入不受影响");
+
+  // 造单卡召唤记录 + 阵容记录
+  const SUMMONS = join(SUMMON_STATE, "summons.json");
+  const writeSummon = (obj) => {
+    mkdirSync(SUMMON_STATE, { recursive: true });
+    writeFileSync(SUMMONS, `${JSON.stringify(obj, null, 1)}\n`);
+  };
+  writeSummon({
+    [SESSION]: { fullPath: "creator/probe-card-slug", name: "探针卡", kind: "card", chars: 100 },
+    [castSession]: { fullPath: "a/x,b/y", name: "阵容(2人)：甲、乙", kind: "cast" },
+  });
+
+  // 卡片记忆文件：先建一条
+  mkdirSync(join(HOME, ".dsh/memory/cards"), { recursive: true });
+  writeFileSync(CARD_PATH, "- [2026-01-01] 探针卡喜欢咖啡\n");
+
+  const cardCompose = compose({ agent: { id: SESSION } });
+  check(cardCompose.includes("长期记忆"), "card: 召唤会话注入屏蔽说明块");
+  check(cardCompose.includes(CARD_PATH), "card: 屏蔽说明给出卡片记忆写入路径");
+  check(!cardCompose.includes("Global memory"), "card: 召唤会话不再注入全局层");
+  check(!cardCompose.includes("probe project index entry"), "card: 召唤会话不再注入项目层");
+  check(!cardCompose.includes("记忆纪律"), "card: 召唤会话不注入普通纪律块");
+  check(cardCompose.includes("探针卡喜欢咖啡"), "card: 卡片记忆正文注入");
+  check(!cardCompose.includes("probe global fact"), "card: 召唤会话看不到全局条目");
+
+  // 阵容：各成员分摊注入；没有单卡写入路径
+  writeFileSync(`${HOME}/.dsh/memory/cards/a_x.md`, "- [2026-01-01] 成员甲事实\n");
+  const castCompose = compose({ agent: { id: castSession } });
+  check(castCompose.includes("多卡阵容"), "card: 阵容注入说明是阵容口径");
+  check(castCompose.includes("成员甲事实"), "card: 阵容注入成员卡记忆");
+  check(!castCompose.includes("只写卡片记忆："), "card: 阵容不给单卡写入路径");
+
+  // cardsEnabled=false：只剩屏蔽说明、没有卡片正文
+  store.cardsEnabled = false;
+  const offCompose = compose({ agent: { id: SESSION } });
+  check(offCompose.includes("长期记忆") && !offCompose.includes("探针卡喜欢咖啡"), "card: cardsEnabled=false 只剩屏蔽说明");
+  store.cardsEnabled = true;
+
+  // 写守卫：召唤中写全局/项目/规则 → deny；写卡片记忆 → 放行且走规则
+  const pre = mountedHooks["tools/pre-execute"];
+  const denyWrite = (id, args) => pre({ name: "write", agent: { id }, arguments: args }, passNext);
+  const d1 = await denyWrite(SESSION, { file_path: `${HOME}/.dsh/memory/topics/foo.md`, content: "- [2026-01-01] x\n" });
+  check(d1.kind === "deny" && d1.reason.includes("角色卡召唤"), "card: 召唤中写全局 topics → deny");
+  const d2 = await denyWrite(SESSION, { file_path: `${HOME}/.dsh/memory/projects/${SLUG}/MEMORY.md`, content: "- [Demo](x.md) — y\n" });
+  check(d2.kind === "deny", "card: 召唤中写项目层 → deny");
+  const d3 = await denyWrite(SESSION, { file_path: `${HOME}/.dsh/AGENTS.md`, content: "# rule\n" });
+  check(d3.kind === "deny", "card: 召唤中写规则文件 → deny");
+  const okCard = await denyWrite(SESSION, { file_path: CARD_PATH, content: "- [2026-01-01] 探针卡喜欢红茶\n" });
+  check(okCard === NEXT_PASSED, "card: 召唤中写卡片记忆 → 放行");
+  const badCard = await denyWrite(SESSION, { file_path: CARD_PATH, content: "- [2026-13-99] bad date\n" });
+  check(badCard.kind === "deny", "card: 卡片层仍走规则（坏日期 → deny）");
+  const bashCard = await pre({ name: "bash", agent: { id: SESSION }, arguments: { command: `echo x >> ~/.dsh/memory/cards/${CARD_SLUG}.md` } }, passNext);
+  check(bashCard === NEXT_PASSED, "card: 召唤中 bash 只写卡片记忆 → 放行");
+  const bashGlobal = await pre({ name: "bash", agent: { id: SESSION }, arguments: { command: "echo x >> ~/.dsh/memory/topics/foo.md" } }, passNext);
+  check(bashGlobal.kind === "deny", "card: 召唤中 bash 写全局记忆 → deny（不给 ask）");
+  const bashNormal = await pre({ name: "bash", agent: { id: "sess-probe-agent" }, arguments: { command: "echo x >> ~/.dsh/memory/topics/foo.md" } }, passNext);
+  check(bashNormal.kind === "ask", "card: 非召唤 bash 写记忆维持 ask");
+
+  // 清除路由：列表 + 删除（带头 / 不带头 / 坏 slug / 正常删）
+  const listJson = await callRoute(fakeReq({ method: "GET" }));
+  const listed = JSON.parse(listJson.body);
+  check(
+    listed.ok === true && listed.cards.some((c) => c.slug === CARD_SLUG && c.entries === 1),
+    "card: 列表含刚写的卡（无名注释时 name 兜底 = slug）",
+  );
+
+  const callDelete = (headers, slug) => callRoute(fakeReq({ method: "POST", url: "/dsh-memory/cards/delete", headers }), JSON.stringify({ slug }));
+  const noHeader = await callDelete({}, CARD_SLUG);
+  check(noHeader.code === 403, "card: 删除无头 → 403");
+  const badSlug = await callDelete({ "x-dsh-memory": "1" }, "../etc");
+  check(JSON.parse(badSlug.body).ok === false && badSlug.code === 400, "card: 坏 slug → 400（越不出去）");
+  const delOk = await callDelete({ "x-dsh-memory": "1" }, CARD_SLUG);
+  check(JSON.parse(delOk.body).ok === true && !existsSync(CARD_PATH), "card: 正常删除成功（文件消失）");
+  check(readFileSync(`${HOME}/.dsh/memory/audit.log`, "utf8").includes("card-memory-delete"), "card: 删除前全文进审计（回滚点）");
+  const listAfter = await callRoute(fakeReq({ method: "GET" }));
+  check(!JSON.parse(listAfter.body).cards.some((c) => c.slug === CARD_SLUG), "card: 删除后列表不再含该卡");
+
+  // 恢复现场：清掉召唤记录，让既有断言回到非召唤口径
+  rmSync(SUMMON_STATE, { recursive: true, force: true });
+  check(at(CWD).includes("全局记忆"), "card: 移除召唤记录后注入恢复原状");
+}
+
+// ══ Windows 路径回归（issue #1：HOME 为空 → 所有路径落到盘根）═════════════════
+{
+  // 纯函数：分隔符归一 / 盘符 slug / 反斜杠路径归属
+  check(
+    host.normalizeToolPath("C:\\Users\\probe\\.dsh\\memory\\topics\\a.md") === "C:/Users/probe/.dsh/memory/topics/a.md",
+    "win: 反斜杠路径归一成正斜杠",
+  );
+  check(host.normalizeToolPath(`${HOME}/.dsh/memory/cards/`) === `${HOME}/.dsh/memory/cards`, "win: 去尾斜杠");
+  check(host.normalizeToolPath("~/.dsh/memory/topics/a.md") === `${HOME}/.dsh/memory/topics/a.md`, "win: 展开 ~");
+  check(
+    host.normalizeToolPath("${HOME}/.dsh/memory/topics/a.md") === `${HOME}/.dsh/memory/topics/a.md`,
+    "win: 展开 ${HOME}",
+  );
+  check(
+    host.normalizeToolPath("%USERPROFILE%\\.dsh\\memory\\a.md") === `${HOME}/.dsh/memory/a.md`,
+    "win: 展开 %USERPROFILE%",
+  );
+  check(host.slugOf("/Users/probe/code/demo") === SLUG, "win: POSIX slug 保持不变");
+  check(host.slugOf("C:\\Users\\probe\\code\\demo") === "--C-Users-probe-code-demo--", "win: 盘符 cwd → 合法目录名");
+  check(host.slugOf("\\\\server\\share\\proj") === "--server-share-proj--", "win: UNC cwd → 合法目录名");
+  check(
+    host.memoryTargetOf(`${HOME}/.dsh/memory/topics/a.md`.replace(/\//g, "\\"))?.kind === "topic",
+    "win: 反斜杠形态的 topics 路径仍归 topic",
+  );
+  check(
+    host.memoryTargetOf(`${HOME}/.dsh/memory/projects/${SLUG}/MEMORY.md`.replace(/\//g, "\\"))?.kind === "project-index",
+    "win: 反斜杠形态的项目索引仍归 project-index",
+  );
+  check(
+    host.bashTouchesMemory(`echo x >> "${HOME}\\.dsh\\memory\\topics\\a b.md"`),
+    "win: bash 反斜杠 + 引号内空格路径命中记忆",
+  );
+  check(
+    host.bashTouchesMemory(`cat "${HOME}\\.dsh\\memory\\topics\\a.md" 2>/dev/null`) === false,
+    "win: 反斜杠只读命令 + 2>/dev/null 仍不误判",
+  );
+  if (process.platform === "darwin" || process.platform === "win32") {
+    check(host.memoryTargetOf(`${HOME}/.DSH/MEMORY/TOPICS/a.md`)?.kind === "topic", "win: 大小写不敏感平台按小写比较");
+  }
+
+  // 子进程：模块级 HOME 在「HOME 为空」与「Windows 盘符 home」下的解析
+  const indexUrl = new URL("../index.js", import.meta.url).href;
+  const runChild = (env, body) => {
+    const script = `
+import os from "node:os";
+import { sep } from "node:path";
+const host = await import(${JSON.stringify(indexUrl)});
+const B = String.fromCharCode(92);
+${body}
+`;
+    return spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, ...env },
+      encoding: "utf8",
+    });
+  };
+  const childJson = (result) => {
+    const line = String(result.stdout ?? "").trim().split("\n").pop();
+    try {
+      return JSON.parse(line);
+    } catch {
+      return { stdout: result.stdout, stderr: result.stderr };
+    }
+  };
+
+  // ① Windows 的真实条件：HOME 未定义（这里用空串模拟），USERPROFILE 由宿主提供。
+  //    旧代码 HOME = "" → 派生出 /.dsh/... → 这里会全部是 null / 空串。
+  const emptyHome = childJson(
+    runChild(
+      { HOME: "" },
+      `
+const home = (os.homedir() || os.userInfo().homedir).split(sep).join("/");
+console.log(JSON.stringify({
+  home,
+  tilde: host.normalizeToolPath("~/.dsh/memory/topics/a.md"),
+  topic: host.memoryTargetOf(home + "/.dsh/memory/topics/a.md")?.kind ?? null,
+  rules: host.memoryTargetOf(home + "/.dsh/AGENTS.md")?.kind ?? null,
+}));
+`,
+    ),
+  );
+  check(
+    typeof emptyHome.home === "string" && emptyHome.home.length > 0 && emptyHome.tilde === `${emptyHome.home}/.dsh/memory/topics/a.md`,
+    "win: HOME 为空时 home 仍解析出值（旧代码 = 空串 → 盘根）",
+  );
+  check(
+    emptyHome.topic === "topic" && emptyHome.rules === "rules",
+    "win: HOME 为空时记忆路径仍归钩子管辖（写入守卫不再静默失效）",
+  );
+
+  // ② Windows 盘符 home：C:\Users\probe + 反斜杠工具路径 / bash 命令。
+  const WIN_HOME = "C:\\Users\\probe";
+  const winHome = childJson(
+    runChild(
+      { HOME: "", USERPROFILE: WIN_HOME, PROBE_HOME: WIN_HOME },
+      `
+const H = process.env.PROBE_HOME;
+const p = (rest) => H + B + rest.split("/").join(B);
+const q = (rest) => '"' + p(rest) + '"';
+console.log(JSON.stringify({
+  home: host.normalizeToolPath("~"),
+  topic: host.memoryTargetOf(p(".dsh/memory/topics/a.md"))?.kind ?? null,
+  rules: host.memoryTargetOf(p(".dsh/AGENTS.md"))?.kind ?? null,
+  project: host.memoryTargetOf(p(".dsh/memory/projects/--C-Users-probe-code-demo--/MEMORY.md"))?.kind ?? null,
+  caseTopic: host.memoryTargetOf(p(".DSH/MEMORY/TOPICS/a.md"))?.kind ?? null,
+  bash: host.bashTouchesMemory("echo x >> " + q(".dsh/memory/topics/a b.md")),
+  bashRead: host.bashTouchesMemory("cat " + q(".dsh/memory/topics/a.md") + " 2>/dev/null"),
+  slug: host.slugOf(H + B + "code" + B + "demo"),
+}));
+`,
+    ),
+  );
+  check(winHome.home === "C:/Users/probe", `win: 盘符 home 归一为正斜杠（实际 ${JSON.stringify(winHome.home)}）`);
+  check(
+    winHome.topic === "topic" && winHome.rules === "rules" && winHome.project === "project-index",
+    "win: 盘符 + 反斜杠的真实工具路径全部归位",
+  );
+  check(process.platform === "linux" || winHome.caseTopic === "topic", "win: 盘符 home 下大小写不敏感匹配");
+  check(winHome.bash === true && winHome.bashRead === false, "win: bash 守卫在反斜杠 + 空格路径下仍准确");
+  check(winHome.slug === "--C-Users-probe-code-demo--", "win: 盘符 cwd 的 slug 不含非法字符（与 DSH projectKey 同形）");
 }
 
 console.log("dsh-memory probe — two-layer memory + rules, viewable & editable");

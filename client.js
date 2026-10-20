@@ -422,7 +422,7 @@
               ? (function () {
                   var n = (file.text || "").length;
                   // 索引模式注入的是索引、不是这份正文 —— 用 maxChars 口径描述会误导
-                  if (injectModeValue === "map") return n + " 字符 · 地图模式（只进片级地图，条目按需 grep + read）";
+                  if (injectModeValue === "map") return n + " 字符 · 地图模式（只进片级地图，条目按需 memory_search + read）";
                   if (injectModeValue === "index") return n + " 字符 · 索引模式（正文按需 read，上表只进片级索引）";
                   if (maxCharsValue <= 0) return n + " 字符 · 全量注入";
                   if (n <= maxCharsValue) return n + " 字符 · 全量注入（上限 " + maxCharsValue + "）";
@@ -632,7 +632,7 @@
               react.createElement(
                 "p",
                 { className: "dm-limit-desc" },
-                "地图模式（默认）：提示词里只放**片级地图** —— 片名 · 关键词 · 条数 · 体量 · 最新日期；条目标题与正文都不进提示词，模型拿任务关键词 grep 记忆目录、按命中行号 read。" +
+                "地图模式（默认）：提示词里只放**片级地图** —— 片名 · 关键词 · 条数 · 体量 · 最新日期；条目标题与正文都不进提示词，模型先调 memory_search 取线索、按命中行号 read，无命中或要精确正则时才 grep 记忆目录。" +
                   "条目 ≤ 12 条的层（典型是项目层单文件）仍逐条内联，省掉一次检索。" +
                   "索引模式：地图 + 每片最新 N 条「标题 · 行号」，受「索引预算」约束 —— 预算装不下全量逐条时按片收缩为「每片最新 N 条」，不会整层变成空目录。" +
                   "全文注入：把分片正文整篇放进提示词；分片总量超过「正文上限」时自动回退索引模式（分片规模下通常都会回退）。",
@@ -690,7 +690,7 @@
                       ? react.createElement(
                           "p",
                           { className: "dm-limit-desc" },
-                          "地图模式不列条目：检索 = 用关键词 grep 记忆目录（命中行自带行号）→ 按行号 read。想让条目标题常驻并受「索引预算」约束，切到「索引模式」。目录形态的项目层（人写的 MEMORY.md）仍整篇注入，受下面的「字符预算」约束。",
+                          "地图模式不列条目：检索 = 先调 memory_search 取线索 → 按行号 read；无命中或要精确正则时才 grep 记忆目录。想让条目标题常驻并受「索引预算」约束，切到「索引模式」。目录形态的项目层（人写的 MEMORY.md）仍整篇注入，受下面的「字符预算」约束。",
                         )
                       : null,
                     react.createElement(

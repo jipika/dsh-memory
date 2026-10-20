@@ -3,6 +3,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -13,6 +14,8 @@ import {
 } from "node:fs";
 import { execFile, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { homedir, userInfo } from "node:os";
+import { dirname, resolve } from "node:path";
 
 // dsh-memory —— 两层长期记忆注入（全局 + 按项目）+ 全局规则文件，带开关，全部实时。
 //
@@ -36,6 +39,14 @@ import { randomUUID } from "node:crypto";
 // 超预算时的注入策略（见 clamp）：保头部 + 附**溢出条目索引**（带全文行号，可按行号
 // read 取回），而不是从中间一刀切掉、剩下部分毫无线索。
 //
+// 卡片记忆层（v0.9.0，防「角色扮演污染长期记忆」）：
+//   CARDS    ~/.dsh/memory/cards/<cardSlug>.md   一张卡一个文件，随卡保留
+//   当前会话在 dsh-card-summon 的 summons.json 里有记录（召唤中）→ compose 不注入
+//   全局/项目层与纪律块，改注入「屏蔽说明 + 本卡卡片记忆正文」；writeGuard 对
+//   全局/项目/规则层一律 deny（bash 命中记忆也不放行），只有卡片记忆路径照常走规则。
+//   列表/清除路由供 dsh-card-summon 召唤面板与设置面板用（删除前全文进审计 = 回滚点）。
+//   开关 cardsEnabled（默认 true）：关掉则召唤会话整段不注入、卡片路径同样被拦。
+//
 // 零额外 LLM 成本：不调用任何模型，只读 markdown 文件；写入由当前会话的 agent 顺手完成，
 // 或者由「设置 → 记忆」面板直接改（host 半的写路由）。
 //
@@ -44,6 +55,8 @@ import { randomUUID } from "node:crypto";
 //   POST /dsh-memory/write   { target, file, text }   需要头 x-dsh-memory: 1
 //   GET  /dsh-memory/settings                          开关当前值 + 已知项目
 //   POST /dsh-memory/settings  { patch }               合并写开关，需要头 x-dsh-memory: 1
+//   GET  /dsh-memory/cards                             卡片记忆分片列表（只读）
+//   POST /dsh-memory/cards/delete  { slug }            按卡清除，需要头 x-dsh-memory: 1
 //
 // 钩子（v0.5.0 起，settings 的 dsh-memory 节可配）：
 //   writeGuard         "rules"(默认) = 内置规则引擎；"full" = 规则 + 外部命令；"off" = 不拦
@@ -57,7 +70,132 @@ import { randomUUID } from "node:crypto";
 //   injectHookCommand  注入文本的外部过滤命令（stdin 进、stdout 出；默认空 = 不过滤）
 //   audit              写入落盘后追加 ~/.dsh/memory/audit.log（JSONL，默认 true）
 
-const HOME = process.env.HOME ?? "";
+// ── 跨平台 home / 路径归一化（issue #1）──────────────────────────────────────
+// Windows 上 `process.env.HOME` 不存在（只有 USERPROFILE）。旧写法 `HOME ?? ""` 把 home
+// 解析成空串，所有派生路径就从盘根开始（`/.dsh/memory`、`C:\.dsh\...`）—— 注入索引恒空、
+// 面板读写错位，写入守卫的字符串前缀也永远匹配不上真实路径。这里与 DSH 官方
+// `@deepseek-ai/dsh-home-paths` 的 `defaultDshHome()` 同源（`os.homedir()`：Windows 读
+// USERPROFILE、POSIX 读 HOME），并把分隔符统一成正斜杠再参与比较。
+
+/** Windows 盘符根（`C:/`）：去尾斜杠时不能把根去掉。 */
+const DRIVE_ROOT_RE = /^[A-Za-z]:\/$/;
+
+/**
+ * 取第一个非空文本（空串 / 纯空白都算未设置）。
+ * @param {...unknown} values - 候选值。
+ * @returns {string} 第一个非空值；都没有返回空串。
+ */
+function firstText(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return "";
+}
+
+/**
+ * 路径文本归一化：剥外层引号、反斜杠转 `/`、折叠重复分隔符（保留 UNC 的 `//` 前缀）、
+ * 去尾斜杠。只用于拼路径与比较，不用于原样显示。
+ * @param {unknown} raw - 任意路径文本。
+ * @returns {string} 归一化后的路径；空输入返回空串。
+ */
+function normalizePathText(raw) {
+  let s = typeof raw === "string" ? raw.trim() : "";
+  if (s.length === 0) return "";
+  if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) {
+    s = s.slice(1, -1).trim();
+  }
+  const unc = s.startsWith("\\\\") || s.startsWith("//");
+  s = s.replace(/\\/g, "/").replace(/\/+/g, "/");
+  if (unc && !s.startsWith("//")) s = `/${s}`;
+  if (s.length > 1 && !DRIVE_ROOT_RE.test(s)) s = s.replace(/\/+$/, "");
+  return s;
+}
+
+/**
+ * 把工具参数 / shell 里的路径统一成可比较形态：归一化 + 展开 `~`、`$HOME`、`%USERPROFILE%`。
+ * @param {unknown} raw - 路径文本。
+ * @returns {string} 归一化路径；空输入返回空串。
+ */
+function normalizeToolPath(raw) {
+  let s = normalizePathText(raw);
+  if (s.length === 0) return "";
+  s = s
+    .replace(/^\$\{HOME\}(?=\/)/, () => HOME)
+    .replace(/^\$HOME(?=\/)/, () => HOME)
+    .replace(/^%USERPROFILE%(?=\/)/i, () => HOME)
+    .replace(/^\$env:USERPROFILE(?=\/)/i, () => HOME);
+  if (s === "~") return HOME;
+  if (s.startsWith("~/")) return `${HOME}${s.slice(1)}`;
+  return s;
+}
+
+/**
+ * 解析用户 home：与 DSH 官方 `defaultDshHome()` 同源。
+ *
+ * `os.homedir()` 在 POSIX 上直接回显 `$HOME` —— **HOME 存在但为空串时返回空串**，
+ * 不会回落到 passwd。所以按平台先挑环境变量，再 `homedir()`，最后
+ * `os.userInfo().homedir`（passwd 记录）兜底；Windows 上 USERPROFILE 优先。
+ * @returns {string} 归一化后的 home；完全解析不出时为空串。
+ */
+function resolveHome() {
+  const fromEnv = normalizePathText(
+    process.platform === "win32"
+      ? firstText(process.env.USERPROFILE, process.env.HOME)
+      : firstText(process.env.HOME, process.env.USERPROFILE),
+  );
+  try {
+    const fromOs = normalizePathText(homedir());
+    if (fromOs.length > 0) return fromOs;
+  } catch {
+    /* 无 home 记录：继续兜底 */
+  }
+  if (fromEnv.length > 0) return fromEnv;
+  try {
+    return normalizePathText(userInfo().homedir);
+  } catch {
+    return "";
+  }
+}
+
+const HOME = resolveHome();
+
+/**
+ * 路径比较是否忽略大小写：Windows / macOS 默认文件系统都不区分大小写；
+ * Linux 保持区分，避免把仅大小写不同的另一个文件误判成记忆文件。
+ */
+const CASE_INSENSITIVE_PATHS = process.platform === "win32" || process.platform === "darwin";
+
+/**
+ * 比较键：大小写不敏感平台统一小写。
+ * @param {string} path - 已归一化路径。
+ * @returns {string} 比较键。
+ */
+function pathKey(path) {
+  return CASE_INSENSITIVE_PATHS ? path.toLowerCase() : path;
+}
+
+/**
+ * 两个已归一化路径是否指同一位置。
+ * @param {string} a - 路径。
+ * @param {string} b - 路径。
+ * @returns {boolean} 是否相同。
+ */
+function samePath(a, b) {
+  return pathKey(a) === pathKey(b);
+}
+
+/**
+ * child 是否等于 root 或位于 root 之下（两者都已归一化）。
+ * @param {string} child - 被检查路径。
+ * @param {string} root - 根路径。
+ * @returns {boolean} 是否在根内。
+ */
+function isUnderPath(child, root) {
+  if (child.length === 0 || root.length === 0) return false;
+  const key = pathKey(child);
+  const base = pathKey(root);
+  return key === base || key.startsWith(`${base}/`);
+}
 
 /** 全局层记忆文件。 */
 const GLOBAL_MEMORY = `${HOME}/.dsh/memory.md`;
@@ -95,13 +233,26 @@ const INDEX_PER_SHARD_LADDER = [8, 5, 3, 2, 1, 0];
  * 地图模式（`injectMode: "map"`，**默认档**）的层内内联阈值。
  *
  * 条目数 ≤ 该值的层仍然逐条列出标题：这类层本来只有几百字符（项目层单文件就是这种形态），
- * 内联出来比让模型多跑一次 grep 更值。超过阈值的层（典型是全局分片，35 片 / 333 条）只给
- * 「片名 · 关键词 · 条数 · 最新日期」的片级地图，条目标题与正文一律按需 grep + read。
+ * 内联出来比让模型多跑一次检索更值。超过阈值的层（典型是全局分片，35 片 / 333 条）只给
+ * 「片名 · 关键词 · 条数 · 最新日期」的片级地图，条目标题与正文一律按需 memory_search + read（grep 只做 fallback）。
  */
 const MAP_INLINE_MAX_ENTRIES = 12;
 
 /** 项目层记忆目录。 */
 const PROJECT_DIR = `${HOME}/.dsh/memory/projects`;
+
+/** 卡片记忆层目录：角色卡召唤会话的剧情/世界事实落在这里，与全局/项目层完全隔离。 */
+const CARDS_DIR = `${HOME}/.dsh/memory/cards`;
+
+/** 卡片记忆的注入预算（字符）。卡片记忆是小体量正文，独立于 maxChars 之外。 */
+const DEFAULT_CARD_BUDGET = 4000;
+
+/**
+ * dsh-card-summon 的自持状态目录（summons.json = 会话 id → 召唤记录）。
+ * 本插件【只读】它判定「当前会话是否处于角色卡召唤中」；不写、不迁移、不清 ——
+ * 生命周期完全归 dsh-card-summon 管。环境变量与其 state.js 同名同语义（测试隔离用）。
+ */
+const CARD_SUMMON_STATE = process.env.DSH_CARD_SUMMON_STATE?.trim() || `${HOME}/.dsh/card-summon`;
 
 /** 全局规则文件所在目录（DSH home）。 */
 const RULES_DIR = `${HOME}/.dsh`;
@@ -138,6 +289,9 @@ let HOST_CTX = null;
 // 钩子子系统的纯函数与处理器：导出仅供 tests/probe.mjs 直测（host 半边自包含，无副作用）。
 export {
   memoryTargetOf,
+  slugOf,
+  normalizePathText,
+  normalizeToolPath,
   lexicalSearchTokens,
   lexicalRequiredMatchCount,
   entryRows,
@@ -194,8 +348,11 @@ function normalizeSettings(value) {
   return {
     globalEnabled: v.globalEnabled !== false,
     projectEnabled: { ...enabled },
+    // 卡片记忆层（召唤会话的按卡记忆）：默认开。关掉 = 召唤中整段不注入、
+    // 写卡片记忆路径同样被拦（此时召唤会话完全没有可写层）。
+    cardsEnabled: v.cardsEnabled !== false,
     maxChars: budget,
-    // 默认 map（片级地图）：条目标题不常驻，改由 grep 按需取；
+    // 默认 map（片级地图）：条目标题不常驻，改由 memory_search 按需取；
     // index = 地图 + 逐条标题（受 indexBudget 收缩）；full = 正文整篇注入
     injectMode: v.injectMode === "full" ? "full" : v.injectMode === "index" ? "index" : "map",
     // 索引模式自己的预算：与 maxChars（正文上限）解耦，面板上两个档位各自独立
@@ -252,12 +409,18 @@ function knownProjects() {
 
 /**
  * 把工作目录编码成记忆 slug，规则与 DSH 的 `~/.dsh/sessions/<slug>` 一致。
+ *
+ * Windows 上 cwd 是 `C:\Users\me\repo`：反斜杠与盘符冒号都不是合法的目录名字符，
+ * 先归一成正斜杠、再把盘符与分隔符折成 `-`（`--C-Users-me-repo--`），与 DSH
+ * `projectKey()` 的盘符处理一致；POSIX 路径的既有 slug 保持不变。
  * @param {string} cwd - 会话工作目录。
  * @returns {string} slug。
  */
 function slugOf(cwd) {
-  const trimmed = String(cwd).replace(/\/+$/, "");
-  return `--${trimmed.replace(/^\/+/, "").replace(/\//g, "-")}--`;
+  const normalized = normalizePathText(String(cwd ?? ""));
+  const withoutDrive = normalized.replace(/^([A-Za-z]):(?=\/|$)/, "$1");
+  const slug = withoutDrive.replace(/^\/+/, "").replace(/[/:]+/g, "-");
+  return `--${slug.length > 0 ? slug : "root"}--`;
 }
 
 /**
@@ -767,9 +930,9 @@ function shardHeadLine(s) {
 /**
  * 渲染一层的**片级地图**（地图模式，默认档）：只有片名 / 关键词 / 条数 / 体量 / 最新日期。
  *
- * 与 [renderIndex] 的差别：条目标题与正文都不进提示词。代价是模型必须自己 grep 才看得到
- * 条目 —— 所以头注释必须把「grep 什么、命中后怎么读」写清楚，否则会退化成「没有线索就不读」
- * （那个失败模式见 renderIndexBudgeted 的注释）。
+ * 与 [renderIndex] 的差别：条目标题与正文都不进提示词。代价是模型必须调 memory_search
+ * 才看得到条目 —— 所以头注释必须把「先 memory_search 取线索、命中后按行号读」写清楚，
+ * 否则会退化成「没有线索就不读」（那个失败模式见 renderIndexBudgeted 的注释）。
  *
  * @param {string} header - 层名（写进注释头）。
  * @param {{name:string,path:string}[]} files - 该层文件。
@@ -787,9 +950,9 @@ function renderMap(header, files) {
     // 统计一律挪到段尾，让"变化点"尽量靠后。
     `<!-- ${header} · 地图模式。`,
     "     本层只给「片名 · 关键词」级线索，条目标题与正文都不在提示词里。检索两步走：",
-    '       ① grep pattern="<任务关键词>" path="<下面任一 片路径，或整个记忆目录>"',
-    "       ② 命中行自带行号（条目首行形如 `- [YYYY-MM-DD] 事实`）→ 按行号取回",
-    '          read path="<命中的片路径>" offset=<命中行号> limit=<要取几行> -->',
+    '       ① memory_search query="<任务关键词>" 先取线索（按相关度返回条目 + 文件行号）；',
+    '       ② 按行号取回：read path="<命中的片路径>" offset=<行号> limit=<要取几行>；',
+    '          只有 memory_search 无命中、或要精确正则 / 按路径限定范围时，才用 grep pattern="<关键词>" path="<片路径或记忆目录>" -->',
   ];
   for (const s of shards) {
     out.push("", shardHeadLine(s));
@@ -819,8 +982,8 @@ function renderIndex(header, files, perShard = Infinity, label = "索引模式")
   const out = [
     // 头行只放档位，统计挪到段尾 —— 理由同 renderMap（避免"写一条记忆就让前缀全失效"）。
     `<!-- ${header} · ${label}。`,
-    "     正文不在提示词里 —— 需要细节时按下面的路径读取（offset 就是条目行号）：",
-    '       read path="<路径>" offset=<L 号> limit=<行数> -->',
+    "     正文不在提示词里 —— 先用 memory_search query=\"<任务关键词>\" 取线索，再按行号读取：",
+    '       read path="<路径>" offset=<L 号> limit=<行数>；只有无命中 / 要精确正则 / 已知路径时才直接 grep/read -->',
   ];
   for (const s of shards) {
     out.push("", shardHeadLine(s));
@@ -871,7 +1034,7 @@ function renderIndexBudgeted(header, files, label = "索引模式") {
  * 按注入模式渲染**一层**（地图 / 索引）—— compose 用的统一入口。
  *
  * 地图模式下条目少的层（≤ [MAP_INLINE_MAX_ENTRIES]）仍走逐条索引：这类层只有几百字符，
- * 内联出来比让模型多跑一次 grep 更值（项目层单文件就是这种形态）；条目多的层才收成地图。
+ * 内联出来比让模型多跑一次检索更值（项目层单文件就是这种形态）；条目多的层才收成地图。
  *
  * @param {string} mode - `map` 或 `index`（`full` 不走这里）。
  * @param {string} header - 层名。
@@ -1002,10 +1165,19 @@ function listProjectSlugs() {
  */
 function compose(context) {
   const values = readSettings();
-  const mode = values.injectMode;
-  const blocks = [];
+
+  // ── 召唤分支：角色卡召唤会话完全绕开常规记忆 ─────────────────────────────
+  // context.agent 是宿主 AssembleContext 增广挂上的会话 Agent（只带 id）；
+  // 取不到 id 时不屏蔽（宁可漏判正常注入，不误伤非召唤会话）。
+  const sessionId = context?.agent?.id ?? context?.agent?.session?.header?.id;
+  const guarded = summonGuardHit(sessionId);
+  if (guarded) {
+    return applyInjectFilter(messagesOfSummon(guarded, values));
+  }
 
   // ── 全局层 ──────────────────────────────────────────────────────────────
+  const mode = values.injectMode;
+  const blocks = [];
   if (values.globalEnabled !== false) {
     if (mode === "full") {
       // full 模式：走分片正文（而不是已废弃的 memory.md 导航索引）——见 renderShardFull
@@ -1201,7 +1373,7 @@ function writeMemoryFile(path, text) {
   if (exists && previous === text) return { changed: false, bytes: Buffer.byteLength(text) };
 
   const mode = exists ? statSync(path).mode & 0o777 : 0o600;
-  mkdirSync(path.slice(0, path.lastIndexOf("/")), { recursive: true });
+  mkdirSync(dirname(normalizeToolPath(path)), { recursive: true });
   if (exists) {
     try {
       copyFileSync(path, `${path}.bak`);
@@ -1246,9 +1418,6 @@ function writeMemoryFile(path, text) {
 // 兼容 hookSpecificOutput.permissionDecision），但不 import 任何包 —— 本插件必须
 // 保持零依赖（link: 安装解析不到 profile 的 node_modules）。
 
-/** 受钩子管辖的记忆路径（绝对路径，前缀匹配）。 */
-const GUARDED_PATHS = [`${HOME}/.dsh/memory`, `${HOME}/.dsh/memory.md`, `${HOME}/.dsh/AGENTS.md`];
-
 /** 条目行：`- [YYYY-MM-DD] 事实`。 */
 const ENTRY_LINE_RE = /^\s*-\s*\[(\d{4}-\d{2}-\d{2})\]/;
 
@@ -1273,8 +1442,11 @@ const STALE_RE = /(已卸载|已弃用|已删除|不再使用|不再维护|was u
 /** bash 里「会改文件」的模式：重定向、tee、sed -i。 */
 const BASH_MUTATE_RE = /(>>|>[^&|]|tee\b|sed\s+(?:[^|]*\s)?-i\b)/;
 
-/** 重定向目标：`> f` / `>> f` / `2> f`。fd 复制（`>&2`）与 `/dev/null` 由提取器丢掉。 */
-const BASH_REDIRECT_RE = /(?:^|[\s;&|()])\d?>>?\s*([^\s;&|()<>]+)/g;
+/**
+ * 重定向目标：`> f` / `>> f` / `2> f`。带引号的目标整段捕获（Windows 用户名常含空格），
+ * fd 复制（`>&2`）与 `/dev/null` 由提取器丢掉。
+ */
+const BASH_REDIRECT_RE = /(?:^|[\s;&|()])\d?>>?\s*("[^"]*"|'[^']*'|[^\s;&|()<>]+)/g;
 
 /** tee 的目标文件（跳过 `-a` 之类选项）。 */
 const BASH_TEE_RE = /(?:^|[\s;&|()])tee\b(?:\s+-{1,2}[A-Za-z]+)*\s+([^;&|()]+)/g;
@@ -1282,8 +1454,33 @@ const BASH_TEE_RE = /(?:^|[\s;&|()])tee\b(?:\s+-{1,2}[A-Za-z]+)*\s+([^;&|()]+)/g
 /** sed -i：就地改文件，参数形式太多（macOS 还要跟一个备份后缀），按整条命令保守判。 */
 const BASH_SED_I_RE = /(?:^|[\s;&|()])sed\s+(?:[^;&|()]*?\s)?-i\b/;
 
-/** 记忆路径字面量（bash command 里可能出现的形态）。 */
-const MEMORY_PATH_TOKENS = [`${HOME}/.dsh/memory`, `${HOME}/.dsh/memory.md`, "${HOME}/.dsh/memory", "~/.dsh/memory", "~/.dsh/AGENTS.md"];
+/**
+ * 记忆路径字面量（bash command 里可能出现的形态）。
+ * 匹配前命令文本会先展开 `~` / `$HOME` / `%USERPROFILE%` 并把反斜杠归一成 `/`，
+ * 因此这里只留归一化后的绝对形态即可覆盖 Windows 与 POSIX 两种写法。
+ */
+const MEMORY_PATH_TOKENS = [`${HOME}/.dsh/memory.md`, `${HOME}/.dsh/AGENTS.md`, `${HOME}/.dsh/memory`];
+
+/**
+ * shell 命令文本归一化（**只用于匹配，不用于执行**）：反斜杠转 `/`、展开 home 别名。
+ * @param {unknown} command - shell 命令。
+ * @returns {string} 归一化后的命令文本。
+ */
+function normalizeCommandText(command) {
+  let s = String(command ?? "").replace(/\\/g, "/");
+  s = s.replace(/\$\{HOME\}|\$HOME\b|%USERPROFILE%|\$env:USERPROFILE/gi, () => HOME);
+  return s.replace(/(^|[\s"'=:(;&|])~(?=\/)/g, (_match, lead) => `${lead}${HOME}`);
+}
+
+/**
+ * 命令文本里是否出现记忆管辖路径（大小写按平台规则比较）。
+ * @param {unknown} command - shell 命令。
+ * @returns {boolean} 是否提及。
+ */
+function mentionsMemoryPath(command) {
+  const hay = pathKey(normalizeCommandText(command));
+  return MEMORY_PATH_TOKENS.some((token) => hay.includes(pathKey(token)));
+}
 
 /** audit.log 的轮转阈值。 */
 const AUDIT_MAX_BYTES = 2 * 1024 * 1024;
@@ -1296,25 +1493,218 @@ const DEFAULT_HOOK_TIMEOUT_MS = 10_000;
  * @param {string} path - 绝对路径。
  * @returns {{kind:string, layer:string}|null} 层归属；null = 不归记忆钩子管。
  */
+// ══ 卡片记忆层：召唤状态探测与小工具 ══════════════════════════════════════════
+// 召唤状态是 dsh-card-summon 的 store（~/.dsh/card-summon/summons.json），
+// 这里只读：missing / 坏 JSON 都当「不在召唤中」，宁可漏判也不误屏蔽正常会话。
+
+/** slug：与 dsh-card-summon lib/state.js 的 safeId 同构 —— 卡 fullPath → 文件安全串。 */
+function cardSlugOf(fullPath) {
+  return String(fullPath ?? "").replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+/** 卡片记忆文件路径（slug 已安全化时才合法）。 */
+function cardMemoryPathOf(slug) {
+  if (typeof slug !== "string" || slug.length === 0 || slug.length > 160 || !/^[A-Za-z0-9_-]+$/.test(slug)) return null;
+  return `${CARDS_DIR}/${slug}.md`;
+}
+
+/**
+ * 给一条召唤记录算卡片记忆路径。阵容（cast）的 fullPath 是逗号串 → 没有单卡记忆可写。
+ * @param {object} hit - summons.json 里该会话的记录（fullPath/name/kind…）。
+ * @returns {{slug:string,path:string}|null} null = 没有可写的单卡记忆路径。
+ */
+function cardMemoryOfSummon(hit) {
+  const fullPath = String(hit?.fullPath ?? "");
+  if (fullPath.length === 0 || fullPath.includes(",")) return null;
+  const slug = cardSlugOf(fullPath);
+  const path = cardMemoryPathOf(slug);
+  return path ? { slug, path } : null;
+}
+
+/** mtime 缓存：compose / writeGuard 每轮都会问，同一 mtime 只读一次盘。 */
+let summonCache = { mtime: -1, map: {} };
+
+/**
+ * 读 dsh-card-summon 的召唤状态表（会话 id → 记录）。失败一律返回空表。
+ * @returns {Record<string, object>}
+ */
+function summonMapOnDisk() {
+  const store = `${CARD_SUMMON_STATE}/summons.json`;
+  try {
+    const mtime = statSync(store).mtimeMs;
+    if (summonCache.mtime === mtime) return summonCache.map;
+    const raw = JSON.parse(readFileSync(store, "utf8"));
+    const map = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    summonCache = { mtime, map };
+    return map;
+  } catch {
+    summonCache = { mtime: -1, map: {} };
+    return {};
+  }
+}
+
+/**
+ * 该会话是否正处于召唤中（读 card-summon 的落盘状态）。
+ * @param {string|undefined} sessionId
+ * @returns {object|null} 召唤记录（fullPath/name/kind…）；不在召唤中 = null。
+ */
+function summonOfSession(sessionId) {
+  if (typeof sessionId !== "string" || sessionId.length === 0) return null;
+  const hit = summonMapOnDisk()[sessionId];
+  return hit && typeof hit === "object" ? hit : null;
+}
+
+/**
+ * 当前会话的调用方想屏蔽哪些层 —— compose 与 writeGuard 共用的语义：
+ * 召唤中（有记录）→ 全局层 + 项目层 + 规则层全部视为被屏蔽，写指引给卡片记忆路径。
+ */
+function summonGuardHit(sessionId) {
+  const hit = summonOfSession(sessionId);
+  if (!hit) return null;
+  return { hit, card: cardMemoryOfSummon(hit) };
+}
+
+/**
+ * bash 命令的落盘目标是否**全部**指向卡片记忆目录（召唤中放行的唯一 bash 目标）。
+ * `~` / `$HOME` 在 [normalizeToolPath] 里展开；失败/抽不出目标 = 不放行（保守）。
+ * @param {string} command
+ * @returns {boolean}
+ */
+function bashTargetCardOnly(command) {
+  const targets = bashWriteTargets(command);
+  if (targets.length === 0) return false;
+  return targets.every((target) => isUnderPath(target, CARDS_DIR));
+}
+
+/**
+ * 卡片记忆文件头（写文件时模型自带最好；没有也能从头部注释里解析出展示名）。
+ * @param {object} hit - 召唤记录。
+ * @returns {string}
+ */
+/**
+ * 卡片记忆正文预算截断：超预算在行边界截断并留一行提示（与普通层的 clamp 不同，
+ * 卡片记忆不逐行建索引 —— 一卡的条目量级小，超预算者在文件里按条目 read 即可）。
+ * @param {string} text
+ * @param {string} path - 提示里要给的文件路径。
+ * @param {number} [budget=DEFAULT_CARD_BUDGET]
+ * @returns {string}
+ */
+function clampCard(text, path, budget = DEFAULT_CARD_BUDGET) {
+  if (budget <= 0 || text.length <= budget) return text;
+  let cut = text.lastIndexOf("\n", budget);
+  if (cut < Math.floor(budget / 2)) cut = budget;
+  return `${text.slice(0, cut)}\n<!-- 卡片记忆超预算已截断（剩 ${text.length - cut} 字符）：旧条目按需 read ${path} -->`;
+}
+
+/**
+ * 召唤会话的注入文案（compose 的卡片记忆块）。
+ * 结构：说明块（长期记忆已屏蔽 + 写入指引）+ 卡片记忆正文。
+ * 阵容（cast）会话：各成员卡的记忆分摊注入，不给写入路径（没有单卡sink）。
+ * @param {{hit:object,card:object|null}} guarded - summonGuardHit 的返回。
+ * @param {{cardsEnabled?:boolean}} values - 当前设置。
+ * @returns {string}
+ */
+function messagesOfSummon(guarded, values) {
+  const { hit, card } = guarded;
+
+  // ── 说明块 ──────────────────────────────────────────────────────────────
+  const name = String(hit?.name ?? "角色卡");
+  const lines = [];
+  lines.push(
+    `<!-- 卡片召唤记忆块 · ${name} -->`,
+    `本会话由 dsh-card-summon 召唤（${name}）。长期记忆（全局 ~/.dsh/memory/topics/、项目层、规则文件）【已屏蔽注入，也不应写入】`,
+    `——剧情/世界观/互动事实是卡片上下文，不是用户与仓库的事实，留在长期记忆会污染后续所有会话。`,
+  );
+  if (card && values?.cardsEnabled !== false) {
+    lines.push(
+      `本卡剧情/世界事实【只】写卡片记忆：\`${card.path}\`（一张卡一个文件，随卡保留，召唤面板可清除）。`,
+      `条目格式 \`- [YYYY-MM-DD] 事实\`；新建该文件时第一行写头注释 \`<!-- 卡片记忆 · ${name} · ${String(hit?.fullPath ?? "")} -->\`（清除面板靠它显示卡名）。`,
+      `长文/截图不要进这里，引用文件路径即可。`,
+    );
+  } else {
+    // cardsEnabled 关闭 / 阵容没有单卡路径：明确告知没有可写处，不给模糊暗示。
+    lines.push(
+      card
+        ? "卡片记忆层已在设置中关闭：本会话没有任何可写的记忆路径，剧情事实不记录。"
+        : "本会话是多卡阵容（cast），没有单卡记忆路径：剧情事实不记录，任何长期记忆路径都不要写。",
+    );
+  }
+
+  // ── 卡片记忆正文 ────────────────────────────────────────────────────────
+  const bodies = [];
+  if (values?.cardsEnabled !== false) {
+    if (card) {
+      // 单卡：读自己那份。文件可能还没有（首次召唤）→ 只给说明 + 让模型按需创建。
+      const body = readOrEmpty(card.path).trim();
+      const text = body.length === 0 ? `（本卡还没有卡片记忆，按上面的格式开新条目即可。）` : clampCard(body, card.path);
+      bodies.push(`<!-- 卡片记忆 · ${card.slug} -->\n${text}`);
+    } else {
+      // 阵容：读各成员卡的记忆（fullPath 逗号串），预算整体分摊。
+      const fullPaths = String(hit?.fullPath ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const perBudget = Math.max(600, Math.floor(DEFAULT_CARD_BUDGET / Math.max(1, fullPaths.length)));
+      for (const fp of fullPaths) {
+        const path = cardMemoryPathOf(cardSlugOf(fp));
+        if (!path) continue;
+        const body = readOrEmpty(path).trim();
+        if (body.length === 0) continue;
+        bodies.push(`<!-- 卡片记忆 · ${cardSlugOf(fp)} -->\n${clampCard(body, path, perBudget)}`);
+      }
+    }
+  }
+
+  const cardText = bodies.length > 0 ? `\n\n${bodies.join("\n\n")}` : "";
+  return neutralizePromptVars(`${lines.join("\n")}${cardText}`);
+}
+
+/**
+ * 判断路径是否落在钩子管辖范围内，并给出层归属。
+ *
+ * 比较前先归一化（反斜杠 → `/`、展开 `~` / `$HOME`），Windows / macOS 再按大小写不敏感比较 ——
+ * 否则 Windows 上真实的 `C:\Users\me\.dsh\memory\...` 永远匹配不上 `${HOME}/.dsh/memory`，
+ * 写入守卫、审计与读取提醒都会静默失效（issue #1）。
+ * @param {string} path - 工具给出的文件路径。
+ * @returns {{kind:string, layer:string}|null} 层归属；null = 不归记忆钩子管。
+ */
 function memoryTargetOf(path) {
-  if (typeof path !== "string" || path.length === 0) return null;
-  if (path === `${HOME}/.dsh/memory.md`) return { kind: "global-single", layer: "global" };
-  if (path === `${HOME}/.dsh/AGENTS.md`) return { kind: "rules", layer: "rules" };
+  const normalized = normalizeToolPath(path);
+  if (normalized.length === 0) return null;
+  if (samePath(normalized, `${HOME}/.dsh/memory.md`)) return { kind: "global-single", layer: "global" };
+  if (samePath(normalized, `${HOME}/.dsh/AGENTS.md`)) return { kind: "rules", layer: "rules" };
   const root = `${HOME}/.dsh/memory`;
-  if (path !== root && !path.startsWith(`${root}/`)) return null;
-  const rel = path.slice(root.length + 1);
-  if (rel.startsWith("topics/")) return { kind: rel.endsWith(".md") ? "topic" : "plugin-internal", layer: "global" };
-  if (rel.startsWith("projects/")) {
+  if (!isUnderPath(normalized, root) || samePath(normalized, root)) return null;
+  const rel = normalized.slice(root.length + 1);
+  const relKey = pathKey(rel);
+  if (relKey.startsWith("topics/")) return { kind: relKey.endsWith(".md") ? "topic" : "plugin-internal", layer: "global" };
+  if (relKey.startsWith("cards/")) {
+    // 卡片记忆层：一层一级的一张 .md 一张卡；子层级或非 .md 都算插件内部资产。
+    const rest = rel.slice("cards/".length);
+    const key = pathKey(rest);
+    if (key.endsWith(".md") && !key.slice(0, -3).includes("/")) {
+      return { kind: "card", layer: `card:${rest.slice(0, -3)}` };
+    }
+    return { kind: "plugin-internal", layer: "global" };
+  }
+  if (relKey.startsWith("projects/")) {
     const rest = rel.slice("projects/".length);
-    const slash = rest.indexOf("/");
-    if (slash === -1) return { kind: rest.endsWith(".md") ? "project-single" : "plugin-internal", layer: `project:${rest.replace(/\.md$/, "")}` };
+    const key = pathKey(rest);
+    const slash = key.indexOf("/");
+    if (slash === -1) {
+      return {
+        kind: key.endsWith(".md") ? "project-single" : "plugin-internal",
+        layer: `project:${rest.replace(/\.md$/i, "")}`,
+      };
+    }
     const slug = rest.slice(0, slash);
     const file = rest.slice(slash + 1);
-    if (file === "MEMORY.md") return { kind: "project-index", layer: `project:${slug}` };
-    if (file.endsWith(".md")) return { kind: "project-body", layer: `project:${slug}` };
+    const fileKey = key.slice(slash + 1);
+    if (pathKey(file) === pathKey("MEMORY.md")) return { kind: "project-index", layer: `project:${slug}` };
+    if (fileKey.endsWith(".md")) return { kind: "project-body", layer: `project:${slug}` };
     return { kind: "plugin-internal", layer: `project:${slug}` };
   }
-  if (rel === "audit.log" || rel.endsWith(".bak")) return { kind: "plugin-internal", layer: "global" };
+  if (relKey === "audit.log" || relKey.endsWith(".bak")) return { kind: "plugin-internal", layer: "global" };
   return { kind: "other", layer: "global" };
 }
 
@@ -1512,15 +1902,33 @@ function parseHookOutcome(exitCode, stdout, stderr) {
 }
 
 /**
+ * 外部钩子 / 注入过滤命令所用的 shell。
+ *
+ * Windows 用 `%ComSpec%`（cmd.exe）；POSIX 优先 zsh（保持旧行为），其次 `$SHELL`，
+ * 最后 `/bin/sh`。旧实现硬编码 `/bin/zsh` —— Windows / 精简 Linux 上 spawn 直接
+ * ENOENT，`writeGuard:"full"` 与 `injectHookCommand` 会静默退化成「放行 / 不过滤」。
+ * @param {string} command - 交给 shell 的一整条命令。
+ * @returns {{file:string,args:string[]}} execFile / spawnSync 的 file + args。
+ */
+function shellInvocation(command) {
+  if (process.platform === "win32") {
+    return { file: firstText(process.env.ComSpec) || "cmd.exe", args: ["/d", "/s", "/c", command] };
+  }
+  const shell = ["/bin/zsh", firstText(process.env.SHELL), "/bin/sh"].find((candidate) => candidate && existsSync(candidate)) ?? "/bin/sh";
+  return { file: shell, args: ["-c", command] };
+}
+
+/**
  * 跑一次外部命令钩子：stdin 传 payload JSON。
- * @param {string} command - shell 命令（经 /bin/zsh -c 执行）。
+ * @param {string} command - shell 命令（经 [shellInvocation] 选定的 shell 执行）。
  * @param {object} payload - 判定输入。
  * @param {number} timeoutMs - 超时。
  * @returns {Promise<{decision:string, reason?:string, note?:string}>} 决策。
  */
 function runCommandHook(command, payload, timeoutMs) {
   return new Promise((resolve) => {
-    const child = execFile("/bin/zsh", ["-c", command], { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    const shell = shellInvocation(command);
+    const child = execFile(shell.file, shell.args, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
       const code = error?.killed ? 124 : (error ? (typeof error.code === "number" ? error.code : 1) : 0);
       resolve(parseHookOutcome(code, String(stdout ?? ""), String(stderr ?? "")));
     });
@@ -1605,23 +2013,58 @@ function buildWritePayload(tool, args) {
  *
  * 纯 fd 复制（`>&2`）与 `/dev/null` 不算落盘 —— 这正是「只读命令带
  * `2>/dev/null` 被误判成改记忆」的根因。只读命令（cat/ls/grep）抽不出任何目标。
+ * 每个目标都过 [normalizeToolPath]：去引号、展开 `~` / `$HOME`、反斜杠转 `/`，
+ * 这样 Windows 的 `C:\Users\me\.dsh\memory\a.md` 与 POSIX 写法能走同一套比较。
  *
  * @param {string} command - bash 命令。
- * @returns {string[]} 目标路径（已去引号）；没有写入时为空数组。
+ * @returns {string[]} 目标路径（已归一化）；没有写入时为空数组。
  */
 function bashWriteTargets(command) {
   const cmd = String(command ?? "");
   const out = [];
   const push = (chunk) => {
-    for (const raw of String(chunk ?? "").split(/\s+/)) {
-      const t = raw.replace(/^["']+|["']+$/g, "");
-      if (!t || t === "/dev/null" || /^&\d*$/.test(t)) continue;
-      out.push(t);
+    for (const raw of splitShellWords(chunk)) {
+      if (!raw || raw === "/dev/null" || /^&\d*$/.test(raw)) continue;
+      const target = normalizeToolPath(raw);
+      if (target.length > 0) out.push(target);
     }
   };
   for (const m of cmd.matchAll(BASH_REDIRECT_RE)) push(m[1]);
   for (const m of cmd.matchAll(BASH_TEE_RE)) push(m[1]);
   return out;
+}
+
+/**
+ * 按 shell 引号规则切词（只用于提取落盘目标，不执行命令）：
+ * 双引号 / 单引号内的空格不切，引号本身不进结果。
+ * @param {unknown} text - 一段命令文本。
+ * @returns {string[]} 去引号后的词。
+ */
+function splitShellWords(text) {
+  const words = [];
+  let buffer = "";
+  let quote = "";
+  for (const ch of String(text ?? "")) {
+    if (quote) {
+      if (ch === quote) quote = "";
+      else buffer += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (buffer.length > 0) {
+        words.push(buffer);
+        buffer = "";
+      }
+      continue;
+    }
+    buffer += ch;
+  }
+  if (buffer.length > 0) words.push(buffer);
+  return words;
 }
 
 /**
@@ -1637,10 +2080,10 @@ function bashWriteTargets(command) {
 function bashTouchesMemory(command) {
   const cmd = String(command ?? "");
   if (!BASH_MUTATE_RE.test(cmd)) return false;
-  if (BASH_SED_I_RE.test(cmd)) return MEMORY_PATH_TOKENS.some((t) => cmd.includes(t));
+  if (BASH_SED_I_RE.test(cmd)) return mentionsMemoryPath(cmd);
   const scope = bashWriteTargets(cmd).join(" ");
   if (!scope) return false;
-  return MEMORY_PATH_TOKENS.some((t) => scope.includes(t));
+  return mentionsMemoryPath(scope);
 }
 
 /** 写入钩子的当前配置。 */
@@ -1651,6 +2094,7 @@ function guardConfig() {
     guard,
     command: typeof v.writeHookCommand === "string" ? v.writeHookCommand : "",
     timeoutMs: Number.isFinite(v.hookTimeoutMs) ? Math.max(1000, Math.floor(v.hookTimeoutMs)) : DEFAULT_HOOK_TIMEOUT_MS,
+    values: v,
   };
 }
 
@@ -1664,6 +2108,12 @@ async function writeGuardHook(exec, next) {
   const cfg = guardConfig();
   if (cfg.guard === "off") return next();
 
+  // ── 召唤判定（write/edit/bash 三个分支共用）──────────────────────────────
+  // exec.agent 是宿主挂上的会话 Agent（只带 id）；取不到 = 不屏蔽。
+  const values = cfg.values;
+  const sessionId = exec?.agent?.id;
+  const guarded = summonGuardHit(sessionId);
+
   let decided = null;
   let payloadRef = null;
 
@@ -1671,18 +2121,51 @@ async function writeGuardHook(exec, next) {
     const built = buildWritePayload(exec.name, exec.arguments);
     if (built) {
       payloadRef = built;
-      decided = runWriteRules({ ...built.payload, target: built.target });
-      if (cfg.guard === "full" && cfg.command) {
-        const ext = await runCommandHook(cfg.command, built.payload, cfg.timeoutMs);
-        decided = mergeDecisions(decided, ext);
+      // 召唤中：只有卡片记忆层放行且走完整规则；其余记忆层一律 deny + 给定向。
+      if (guarded && built.target.kind !== "card") {
+        const isCast = String(guarded.hit?.fullPath ?? "").includes(",");
+        const cardHint = guarded.card && values?.cardsEnabled !== false
+          ? `本卡的剧情/世界事实只写卡片记忆：\`${guarded.card.path}\`（条目格式 - [YYYY-MM-DD] 事实）。`
+          : isCast
+            ? "本会话是多卡阵容（cast），没有单卡记忆路径，请不要写长期记忆。"
+            : "本会话的卡片记忆层已关闭：没有任何可写记忆路径，请不要写长期记忆。";
+        decided = {
+          decision: "deny",
+          reason:
+            `dsh-memory write-guard：本会话处于角色卡召唤（${String(guarded.hit?.name ?? "卡片")}），` +
+            `长期记忆（全局 topics/ · 项目层 · 规则文件）已屏蔽 —— 剧情事实留在这里会污染后续所有会话。${cardHint}`,
+        };
+      } else {
+        // 卡片层 / 非召唤：走原有规则引擎。放行卡片层前确保目录存在（native write 不建父目录）。
+        if (!guarded && built.target.kind === "card") mkdirSync(CARDS_DIR, { recursive: true });
+        decided = runWriteRules({ ...built.payload, target: built.target });
+        if (cfg.guard === "full" && cfg.command) {
+          const ext = await runCommandHook(cfg.command, built.payload, cfg.timeoutMs);
+          decided = mergeDecisions(decided, ext);
+        }
       }
     }
   } else if (exec.name === "bash" && bashTouchesMemory(exec.arguments?.command)) {
-    // shell 改记忆不做静态 diff 分析，保守转人工确认。
-    decided = {
-      decision: "ask",
-      reason: "dsh-memory write-guard：这条 shell 命令看起来会改动记忆文件（重定向/tee/sed -i）。请确认；能用 write/edit 工具时优先用工具 —— 会经过完整格式与敏感信息校验。",
-    };
+    if (guarded) {
+      // 召唤中 bash 写记忆：目标全在卡片记忆目录里才放行；否则不给 ask（没人守屏幕，
+      // 配合「屏蔽」也要拦 shell 绕行）——直接 deny 并给卡片路径。
+      if (bashTargetCardOnly(exec.arguments?.command)) {
+        mkdirSync(CARDS_DIR, { recursive: true });
+      } else {
+        decided = {
+          decision: "deny",
+          reason:
+            "dsh-memory write-guard：本会话处于角色卡召唤，shell 不允许写记忆（全局/项目/规则层已屏蔽，" +
+            "卡片记忆也只能用 write/edit 工具走完整规则）。",
+        };
+      }
+    } else {
+      // 非召唤：维持原「保守转人工确认」。
+      decided = {
+        decision: "ask",
+        reason: "dsh-memory write-guard：这条 shell 命令看起来会改动记忆文件（重定向/tee/sed -i）。请确认；能用 write/edit 工具时优先用工具 —— 会经过完整格式与敏感信息校验。",
+      };
+    }
   }
 
   if (!decided) return next();
@@ -1751,7 +2234,7 @@ async function postExecuteHook(exec, result, next) {
     if (exec.name === "read" && !result?.isError && values.readReminder !== false) {
       const hit = memoryTargetOf(exec.arguments?.file_path);
       if (hit && (hit.kind === "topic" || hit.kind === "project-body" || hit.kind === "project-single" || hit.kind === "project-index" || hit.kind === "global-single")) {
-        const text = readOrEmpty(exec.arguments.file_path);
+        const text = readOrEmpty(normalizeToolPath(exec.arguments.file_path));
         const entries = extractEntries(text, hit.kind === "project-index");
         const remind =
           `dsh-memory read-hook：你刚读取的是${hit.layer === "global" ? "全局" : "项目"}记忆（${hit.kind}，${entries.length} 条 / ${text.length} 字符）。` +
@@ -1768,16 +2251,16 @@ async function postExecuteHook(exec, result, next) {
 /**
  * 各注入模式的**开场两条**纪律（检索方式随档位变，其余条共用）。
  *
- * 地图模式（默认）下条目标题不在提示词里，所以第一条必须给出确定动作（grep），否则会退化成
- * 「没线索就不读」—— 那个失败模式在 2026-09-28 的索引预算事故里已经见过一次。
+ * 地图模式（默认）下条目标题不在提示词里，所以第一条必须给出确定动作（先调 memory_search），
+ * 否则会退化成「没线索就不读」—— 那个失败模式在 2026-09-28 的索引预算事故里已经见过一次。
  */
 const DISCIPLINE_HEAD = {
   map: [
-    "     · 【开工先查】非琐碎任务开头先取线索：拿任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）优先用 `memory_search` 工具查记忆（中文自动切分 + 相关度排序，工具表里有就用）；没有该工具再去 grep 记忆目录 —— 全局为 `~/.dsh/memory/topics`，项目层路径见下面各片段；命中片名 / 行号再动手，没命中就不读，别整库通读。（片段里**已经逐条内联**的层不用再检索：直接按行号 `read` 即可；标着「地图模式」的层才需要先查）",
-    "     · 【读法】命中行自带行号 → `read path=<片路径> offset=<行号> limit=<要几条>`；片名与关键词只说明主题、不保证内容，禁止凭片名臆测",
+    "     · 【开工先查】非琐碎任务开头先取线索：拿任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）先调 `memory_search` 查记忆；命中条目 / 行号再动手，没命中就不读，别整库通读。只有 `memory_search` 无命中、或要精确正则 / 按路径限定范围 / 回读已知文件时，才用 `grep` / `read` 直查记忆目录 —— 全局为 `~/.dsh/memory/topics`，项目层路径见下面各片段。（片段里**已经逐条内联**的层不用再检索：直接按行号 `read` 即可；标着「地图模式」的层才需要先查）",
+    "     · 【读法】`memory_search` 命中行自带行号 → `read path=<片路径> offset=<行号> limit=<要几条>`；片名与关键词只说明主题、不保证内容，禁止凭片名臆测",
   ],
   index: [
-    "     · 【开工先查】非琐碎任务开头先扫上面的索引：用任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）优先用 `memory_search` 工具（相关度排序，工具表里有就用），没有就去匹配片名与「关键词」行；命中就 read 该片对应行号再动手；没命中就不读，别整库通读",
+    "     · 【开工先查】非琐碎任务开头先扫上面的索引：拿任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）先调 `memory_search` 查记忆；命中就 `read` 该片对应行号再动手；没命中就不读，别整库通读。只有无命中 / 要精确正则 / 已知路径时，才直接按片名与「关键词」行定位后 `grep` / `read`",
     "     · 【读法】按行号精确 read（offset = 条目行号），禁止凭片名或标题臆测内容；某片只列了最新几条时，按提示的行号区间读更早的条目",
   ],
   full: [
@@ -1816,7 +2299,8 @@ function applyInjectFilter(text) {
   const cmd = readSettings().injectHookCommand;
   if (typeof cmd !== "string" || cmd.length === 0) return text;
   try {
-    const r = spawnSync("/bin/zsh", ["-c", cmd], {
+    const shell = shellInvocation(cmd);
+    const r = spawnSync(shell.file, shell.args, {
       input: text,
       timeout: DEFAULT_HOOK_TIMEOUT_MS,
       maxBuffer: 8 * 1024 * 1024,
@@ -1966,6 +2450,96 @@ async function handleSettings(req, res) {
   return sendJson(res, 200, { ok: true, value: updateSettings(patch), projects: knownProjects() });
 }
 
+// ── 卡片记忆层路由：列表 + 按卡清除（设置面板 / dsh-card-summon 召唤面板共用）──
+
+/**
+ * `GET /dsh-memory/cards`：列卡片记忆分片（只读）。
+ * 头部注释里带展示名与 fullPath（写入说明块里有，模型按格式写时一并带上）；
+ * 解析不出就用 slug 兜底。响应：`{ok, cards:[{slug,name,fullPath,size,entries,updatedAt}]}`
+ * @param {import("node:http").IncomingMessage} req
+ * @param {import("node:http").ServerResponse} res
+ * @returns {Promise<void>}
+ */
+async function handleCardList(req, res) {
+  if (String(req.method ?? "GET").toUpperCase() !== "GET") {
+    return sendJson(res, 405, { ok: false, error: "use GET" });
+  }
+  let names = [];
+  try {
+    if (existsSync(CARDS_DIR)) names = readdirSync(CARDS_DIR).filter((n) => n.endsWith(".md"));
+  } catch (error) {
+    return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+  }
+  const cards = names.map((file) => {
+    const slug = file.slice(0, -3);
+    const path = `${CARDS_DIR}/${file}`;
+    let size = 0;
+    let updatedAt = null;
+    let entries = 0;
+    let name = slug;
+    let fullPath = "";
+    try {
+      const text = readFileSync(path, "utf8");
+      size = text.length;
+      entries = extractEntries(text).length;
+      updatedAt = statSync(path).mtime.toISOString();
+      const head = /<!--\s*卡片记忆\s*·\s*([^·]*)·\s*(.*?)\s*-->/.exec(text.slice(0, 400));
+      if (head) {
+        name = head[1].trim() || slug;
+        fullPath = head[2].trim();
+      }
+    } catch {
+      // 读失败的单卡保持默认值，别让一张坏文件拖垮列表。
+    }
+    return { slug, name, fullPath, size, entries, updatedAt };
+  });
+  return sendJson(res, 200, { ok: true, cards });
+}
+
+/**
+ * `POST /dsh-memory/cards/delete`：按 slug 清除一张卡的卡片记忆。需要 `x-dsh-memory: 1` 头。
+ * 安全边界（照 dsh-temp-chat 的删除纪律）：slug 白名单正则 → 拼出目标路径 → resolve 必须
+ * 以 CARDS_DIR 为前缀 → lstat 拒 symlink → 删除前把全文记进 audit.log（唯一回滚点）→ rm。
+ * @param {import("node:http").IncomingMessage} req
+ * @param {import("node:http").ServerResponse} res
+ * @returns {Promise<void>}
+ */
+async function handleCardDelete(req, res) {
+  if (String(req.headers?.["x-dsh-memory"] ?? "") !== "1") {
+    return sendJson(res, 403, { ok: false, error: "missing x-dsh-memory header" });
+  }
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (error) {
+    return sendJson(res, 400, { ok: false, error: String(error?.message ?? error) });
+  }
+  const path = cardMemoryPathOf(payload?.slug);
+  if (!path) return sendJson(res, 400, { ok: false, error: "bad slug" });
+
+  // resolve 后必须仍在 CARDS_DIR 内 —— slug 正则已挡 ../，这里是第二道防线。
+  // Windows 的 resolve() 返回反斜杠，先归一化再比较，否则每次删除都会被误判成越界。
+  const resolved = normalizePathText(resolve(path));
+  if (!isUnderPath(resolved, normalizePathText(CARDS_DIR))) {
+    return sendJson(res, 403, { ok: false, error: "path escapes cards dir" });
+  }
+  if (!existsSync(resolved)) return sendJson(res, 404, { ok: false, error: "no such card memory" });
+  try {
+    // symlink / 非常规文件拒绝 —— 只删真正的普通 .md 文件。
+    const st = lstatSync(resolved);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      return sendJson(res, 403, { ok: false, error: "not a regular file" });
+    }
+    // 回滚点：全文进审计（手动拷回即恢复）。
+    auditLog({ event: "card-memory-delete", path: resolved, oldText: readOrEmpty(resolved).slice(0, MAX_WRITE_BYTES) });
+    rmSync(resolved);
+    return sendJson(res, 200, { ok: true, slug: payload.slug });
+  } catch (error) {
+    return sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+  }
+}
+
+
 // ── 回合记忆活动投影（v0.8，借鉴 dsh-mnemon 的 TurnActivityProjection）────────
 // 数据源是 session 持久日志（agent.session.snapshotEvents()），请求时增量消费——
 // 不挂事件监听、不需要 per-agent 安装，对插件激活前就存在的会话同样生效。
@@ -2006,7 +2580,7 @@ function toolMemoryHit(name, args) {
     if (!hit || hit.kind === "plugin-internal") return null;
     return { path: args.path, kind: hit.kind === "other" ? "topics-dir" : hit.kind, layer: hit.layer };
   }
-  if (name === "bash" && typeof args.command === "string" && args.command.includes(".dsh/memory")) {
+  if (name === "bash" && typeof args.command === "string" && mentionsMemoryPath(args.command)) {
     return { path: `${HOME}/.dsh/memory`, kind: "other", layer: "global" };
   }
   return null;
@@ -2121,6 +2695,11 @@ async function handleRoute(req, res) {
     if (url.pathname === "/dsh-memory/content") return handleContent(req, res);
     if (url.pathname === "/dsh-memory/settings") return await handleSettings(req, res);
     if (url.pathname === "/dsh-memory/activity") return handleActivity(req, res, url);
+    if (url.pathname === "/dsh-memory/cards") return handleCardList(req, res);
+    if (url.pathname === "/dsh-memory/cards/delete") {
+      if (method !== "POST") return sendJson(res, 405, { ok: false, error: "use POST" });
+      return await handleCardDelete(req, res);
+    }
     if (url.pathname === "/dsh-memory/write") {
       if (method !== "POST") return sendJson(res, 405, { ok: false, error: "use POST" });
       return await handleWrite(req, res);
@@ -2187,8 +2766,8 @@ export function apply(ctx) {
         toolCtx.tools.register({
           name: "memory_search",
           description:
-            "在长期记忆（全局分片 + 项目记忆）中按相关度检索条目。中文自动 bigram 切分、字段加权、覆盖度过滤，返回排序后的条目及其文件行号。" +
-            "开工取线索、找「以前记过的 X」、关键词模糊命中时优先用它；需要精确正则、按路径限定范围或回读已知文件时再用 grep/read。",
+            "按相关度检索长期记忆（全局分片 + 项目记忆），返回条目及其文件行号。" +
+            "任务开工找线索、找以前记过的事，先调它；无命中、或要精确正则 / 按路径限定 / 回读已知文件时，再用 grep/read。",
           parameters: {
             type: "object",
             properties: {

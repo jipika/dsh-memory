@@ -7,12 +7,12 @@
 > Progressive long-term memory for **DeepSeek Harness (DSH)** — memory lives as sharded plain
 > markdown, and only a **live-generated map** (shard · keywords · count · latest date) enters the
 > system prompt, so the prompt cost stays flat however large the memory grows; entries are pulled
-> on demand with `grep` + `read`. Two layers (global + per-project) plus the global
+> on demand with `memory_search` + `read` (`grep` only for exact regex). Two layers (global + per-project) plus the global
 > rule files, **viewable and editable right in DSH Settings**, **zero extra LLM cost**, live re-read.
 >
 > 给 DeepSeek Harness 的**渐进式长期记忆**：正文是分片的纯 markdown，进系统提示词的只有
-> **实时生成的片级地图**（片 · 关键词 · 条数 · 最新日期），条目按任务关键词 `grep` 命中行号再 `read`
-> 取回 —— 记忆再长、提示词开销也恒定。两层结构
+> **实时生成的片级地图**（片 · 关键词 · 条数 · 最新日期），条目先调 `memory_search` 取线索再 `read`
+> 取回（`grep` 只留给精确正则） —— 记忆再长、提示词开销也恒定。两层结构
 > （全局层 + 项目层）外加全局规则文件，**在设置里就能查看并编辑**、**不产生任何额外 LLM 调用**、写完即生效。
 
 [![npm](https://img.shields.io/npm/v/@jipika/dsh-memory?label=npm)](https://www.npmjs.com/package/@jipika/dsh-memory)
@@ -45,8 +45,8 @@ agent 顺手完成** —— 于是它既不花钱，也不出本机，还能被 
 - **写完即生效**：注册的是**函数式** `text`，每次提示词组装都重读文件 —— 不需要重启、不需要刷新。
   （对比：`cordis.patch.yml` 里 `personaPrefix` 的 `!!js` 只在 boot 求值一次。）
 - **渐进式注入，记忆再长也不炸上下文**：默认**地图模式** —— 提示词里只有**片级地图**
-  「片名 · 条数 · 体量 · 最新日期 · 关键词」，条目标题与正文都不进提示词；agent 拿任务关键词
-  `grep` 记忆目录，命中行自带行号，再按行 `read` 取那一条。条目 ≤ 12 条的层（典型是项目层单文件）
+  「片名 · 条数 · 体量 · 最新日期 · 关键词」，条目标题与正文都不进提示词；agent 先调
+  `memory_search` 取线索，命中行自带行号，再按行 `read` 取那一条（无命中 / 精确正则才用 `grep`）。条目 ≤ 12 条的层（典型是项目层单文件）
   仍逐条内联 —— 这类层只有几百字符，内联出来比多跑一次检索更值。
 - **注入头不放动态统计（KV cache 友好）**：每段的头行只写档位名（`… · 地图模式。`），
   片数 / 条数 / 字符数一律挪到该段**最后一行**（`<!-- 本层：N 片 / M 条 / K 字符 -->`）。
@@ -57,7 +57,7 @@ agent 顺手完成** —— 于是它既不花钱，也不出本机，还能被 
   实测：58k 字符的单文件拆成 10 片后，每轮注入从 **29931 → 约 6.6k 字符**；
   35 片 / 333 条 / 233k 字符的真实库：**地图模式 7.3k 字符**，索引模式 12.9k 字符。
 - **三档注入方式**（设置 → 记忆 →「注入方式」）：
-  - **地图模式（默认）**：只给片级地图，条目靠 `grep` + 按行 `read` 按需取 —— 注入最省，
+  - **地图模式（默认）**：只给片级地图，条目靠 `memory_search` + 按行 `read` 按需取 —— 注入最省，
     且**路由线索（片名 + 关键词）一条不少**：没有它，agent 不知道自己缺什么，也就不会去查。
   - **索引模式**：地图 + 每片最新 N 条「标题 · 行号」，超「索引预算」（默认 12000 字符，面板可调
     6K/12K/18K/24K/不限制）时沿 `[8,5,3,2,1]` 逐档收缩为**每片最新 N 条**，每片都保留线索
@@ -217,7 +217,7 @@ Memory upkeep (long-term memory):
 }
 ```
 
-- `injectMode`：`map`（默认，片级地图 + `grep` 按需取条目）/ `index`（地图 + 逐条标题）/
+- `injectMode`：`map`（默认，片级地图 + `memory_search` 按需取条目）/ `index`（地图 + 逐条标题）/
   `full`（正文整篇注入）。
 - `indexBudget`：**索引模式**每轮注入的字符预算（0 = 不限制 → 始终全量逐条）。
   超预算时按 `[8,5,3,2,1]` 逐档收缩为「每片最新 N 条」，**不会整层归零**。
@@ -327,24 +327,45 @@ POST /dsh-memory/settings  { patch }                 # 合并写开关，需请�
 或形如 `--Users-me-code-repo--` 的项目 slug；`file` 只认该层里真实存在的 `.md`（或 `MEMORY.md` 新建）。
 写路由要求 `x-dsh-memory: 1` —— 浏览器跨站简单请求带不上自定义头，省掉一整类 CSRF。
 
+## 卡片记忆层（v0.9.0）
+
+角色卡召唤会话（dsh-card-summon）里的剧情/世界观事实不是「用户与仓库的事实」，混进长期记忆
+会在后续所有会话常驻注入 —— 这一层的职责是**把召唤会话与常规记忆隔离**：
+
+- **注入**：当前会话在 `~/.dsh/card-summon/summons.json` 有记录（含阵容 cast）→ `compose`
+  不注入全局层 / 项目层 / 纪律块，改注入「屏蔽说明 + 本卡卡片记忆正文」；阵容会话展示各成员
+  卡的记忆并分摊预算。开关 `cardsEnabled`（默认 true）。
+- **写入**：writeGuard 对召唤会话的全局 topics / 项目层 / 规则文件一律 deny（含 bash 命中），
+  deny 理由里带本卡记忆路径；只有 `~/.dsh/memory/cards/<cardSlug>.md` 照常走完整规则
+  （条目格式、凭据拦截、破坏性覆盖保护都在）。召唤状态判定读 dsh-card-summon 的落盘 store，
+  只读不改；`DSH_CARD_SUMMON_STATE` 与其 state.js 同名同语义（测试隔离）。
+- **清除**：`GET /dsh-memory/cards`（列表，`name` 从文件头注释 `<!-- 卡片记忆 · 名 · fullPath -->`
+  解析，缺失兜底 slug）与 `POST /dsh-memory/cards/delete { slug }`（需要 `x-dsh-memory: 1` 头；
+  slug 白名单 + resolve 前缀 + 拒 symlink；删除前全文进 audit.log —— 唯一回滚点）。
+  dsh-card-summon 召唤面板的「清除卡片记忆」按钮走的就是这两条路由。
+
 ## 验证
 
 ```bash
 node tests/probe.mjs
 ```
 
-210 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
+283 项断言，全部在**临时 HOME** 里跑（自造记忆文件，不碰你的真实数据），覆盖：两层注入、
 cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开、**地图模式**（默认值 = `map`、
-片级地图不含条目标题、头注释给出 `grep` 检索指引、层内 ≤ 12 条仍逐条内联且头注释仍标「地图模式」、
+片级地图不含条目标题、头注释给出 `memory_search` 检索指引、层内 ≤ 12 条仍逐条内联且头注释仍标「地图模式」、
 目录形态的项目层不受档位影响、纪律块按档位切换：
-地图档教 `grep`、索引档不教、full 档说明正文已注入、检索分级写明优先 `subagent_memory`）、**索引模式**（片名取文件 H1、
+地图档教 `memory_search`、索引档同样先教 `memory_search`、full 档说明正文已注入、检索分级写明优先 `subagent_memory`）、**索引模式**（片名取文件 H1、
 条目带行号、分片目录优先于单文件、**片级关键词与最新日期**、**超预算按「每片最新 N 条」配额收缩而非整层归零**、
 `indexBudget=0` 时全量逐条、`injectMode=full` 的多片注入与**超上限自动回退索引**、单文件回落时仍走 clamp 溢出索引）、
 注入前拆开 `{{`（否则整段组装会被 `dsh-system-prompt` 当未知变量抛错）、读路由（层内文件清单、AGENTS.md、
 单文件形式、路径穿越被拒）、写路由（原子写、`.bak` 回滚点、权限保留、首次建 MEMORY.md、内容未变不重复写、
 白名单外写不进去、缺 `x-dsh-memory` 头 → 403）、钩子规则引擎（格式/凭据/覆写历史/bash 改写）与审计，
 以及设置面板的渲染、「注入方式」三档切换（地图 / 索引 / 全文，含档位联动的预算档位显隐）
-与「展开 → 编辑 → 保存」全流程。
+与「展开 → 编辑 → 保存」全流程。v0.9.0 增补：**卡片记忆层**（召唤会话屏蔽全局/项目/纪律块、
+卡片正文注入、cardsEnabled 开关、阵容分摊、writeGuard 对三层 deny 并给卡片定向、bash 全卡片
+目标放行/其余 deny、列表与删除路由的头部 403 / 坏 slug 400 / 前缀逃逸拒绝 / 删除进审计、
+清除后恢复原状）、**Windows 路径回归**（HOME 为空串时仍解析出 home、盘符/反斜杠路径归位、
+盘符 cwd 的 slug 不含非法字符、bash 守卫识别引号内的空格路径）。
 
 ## 兼容性
 
@@ -352,8 +373,32 @@ cwd→slug 推导、无 agent 时只注入全局、两个开关的开/关/重开
 `tools/pre-execute` / `tools/post-execute`，以及 client 的 `settings.section` 槽位。
 开关走插件自持的 `settings.json` 与自己的路由，不经过宿主设置服务 —— 0.1.7 把 settings 换成
 cordis Config 表单那次换代不影响它。
-在 DSH 0.1.7-rc.2（Desktop 应用）上验证通过：`node tests/probe.mjs` 210 项全绿。
+
+**Windows 路径（v0.9.0 修复 issue #1）**：home 取 `os.homedir()`（与 DSH 官方
+`@deepseek-ai/dsh-home-paths` 的 `defaultDshHome()` 同源）：Windows 走 `USERPROFILE`，
+`HOME` 未定义或为空串时再回落 passwd 记录 —— 不再出现旧实现
+`process.env.HOME ?? ""` 把路径落到 `C:\.dsh\`（盘根）的情况。工具路径、bash 命令与
+面板写入在比较前统一反斜杠 → `/`，Windows / macOS 按大小写不敏感匹配；项目 slug 把
+`C:\Users\me\repo` 折成 `--C-Users-me-repo--`（合法目录名，不再是带冒号/反斜杠的路径）。
+写入守卫、审计、读取提醒因此与注入/面板看到的是同一个 `~/.dsh`。
+
+在 DSH 0.1.7-rc.2（Desktop 应用）上验证通过：`node tests/probe.mjs` 283 项全绿。
 
 ## License
 
 MIT
+
+---
+
+## ☕ 赞赏支持
+
+如果 dsh-memory 对你的研究与测试有所帮助，欢迎请作者喝杯咖啡 ☕
+
+<p align="center">
+  <img src="assets/sponsor.jpg" width="260" alt="微信赞赏码" />
+  <img src="assets/afdian_reward.jpg" width="200" alt="爱发电赞助码" />
+</p>
+
+<p align="center">
+  <b>给项目点个 Star ⭐</b> 同样是对开发者最大的鼓励！
+</p>
