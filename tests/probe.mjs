@@ -704,12 +704,27 @@ check(
   "hook: 写 memory.md → deny",
 );
 check(
-  (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "echo x >> ~/.dsh/memory/topics/a.md" } }, passNext)).kind === "ask",
-  "hook: bash 改记忆 → ask（转人工确认）",
+  (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "echo x >> ~/.dsh/memory/topics/a.md" } }, passNext)) === NEXT_PASSED,
+  "hook: bash 改记忆 → 直接放行（bash-ask 已按用户要求停用，2026-10-23）",
 );
 check(
   (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "cat ~/.dsh/memory/settings.json 2>/dev/null" } }, passNext)) === NEXT_PASSED,
   "hook: bash 只读命令（带 2>/dev/null）→ 直接放行",
+);
+/* bash 凭据字面量预检（2026-10-23）：写记忆的命令文本里出现凭据 → 落盘前 deny；只报 pattern 名不回显值 */
+const bashSkDeny = await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "echo 'sk-abcdefghijklmnop1234' >> ~/.dsh/memory/topics/a.md" } }, passNext);
+check(bashSkDeny.kind === "deny" && bashSkDeny.reason.includes("凭据") && !bashSkDeny.reason.includes("sk-abcdefghijklmnop"), "hook: bash 写记忆带 sk- 字面量 → deny（脱敏）");
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "echo hi | tee -a ~/.dsh/memory/topics/a.md <<< 'ghp_AbCdEfGhIjKlMnOpQrStUvWx 1234'" } }, passNext)).kind === "deny",
+  "hook: bash tee 写记忆带 ghp_ 字面量 → deny",
+);
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "echo 'sk-abcdefghijklmnop1234' >> /tmp/notes.txt" } }, passNext)) === NEXT_PASSED,
+  "hook: 同凭据写 /tmp 非记忆路径 → 放行（范围限于记忆目标）",
+);
+check(
+  (await mountedHooks["tools/pre-execute"]({ name: "bash", arguments: { command: "cat ~/.dsh/memory/topics/a.md | grep -i token" } }, passNext)) === NEXT_PASSED,
+  "hook: 只读命令含 token 字样 → 放行（不写记忆不拦）",
 );
 store.writeGuard = "off";
 check(
@@ -789,6 +804,114 @@ store.writeHookCommand = "";
   check(host.searchMemory("").ok === false, "v0.8: 空 query 拒绝");
   const fmt = host.formatSearchResults(hit);
   check(fmt.includes("read 对应文件的行号取上下文"), "v0.8: render 文本带读取指引");
+
+  // ── v0.9.1 P0 三项：片级加分不再抬条目分 / per-shard 配额 / 作用域收窄 ──────────
+  // ① 片名整句命中、条目零命中 → 旧实现给每条 entry +12 且用片名填满 hitTokens，
+  //    会产出「条目毫无关系却排第一」的假命中；现在必须一条都不出。
+  writeFileSync(join(TOPICS, "p0-shardbonus.md"), "# alphabravo charlie\n- [2026-05-01] zzz totally unrelated qqq\n");
+  const bonusOnly = host.searchMemory("alphabravo charlie", { limit: 20 });
+  check(
+    !bonusOnly.results.some((r) => r.path.endsWith("p0-shardbonus.md")),
+    `v0.9.1: 片名整句命中但条目零命中 → 不再产出假命中（实际 ${bonusOnly.results.filter((r) => r.path.endsWith("p0-shardbonus.md")).length} 条）`,
+  );
+  // ② 每片最多 PER_SHARD_MAX 条：高分片 A 有 5 条、片 B 有 2 条，limit=4 必须各拿 2 条
+  //    （旧 slice(0,4) 会被 A 独占）。
+  const capRow = (d, tag, n) => `- [2026-05-0${tag}] capquery ${d} entry ${n}\n`;
+  // H1 后必须换行：entryRows 靠「新条目行」切断，`# 标题- [日期] …` 粘连会把首条吞进标题行（实测少一条）。
+  writeFileSync(join(TOPICS, "p0-cap-a.md"), "# cap shard alpha\n" + Array.from({ length: 5 }, (_, i) => capRow("a", "2", i)).join(""));
+  writeFileSync(join(TOPICS, "p0-cap-b.md"), "# cap shard beta\n" + Array.from({ length: 2 }, (_, i) => capRow("b", "3", i)).join(""));
+  const capped = host.searchMemory("capquery", { limit: 4 });
+  const perFile = {};
+  for (const r of capped.results) perFile[r.path.split("/").pop()] = (perFile[r.path.split("/").pop()] ?? 0) + 1;
+  check(
+    capped.results.length === 4 && perFile["p0-cap-a.md"] === 2 && perFile["p0-cap-b.md"] === 2,
+    `v0.9.1: per-shard 配额生效，单片不再独占名额（实际 ${JSON.stringify(perFile)}）`,
+  );
+  check(
+    capped.dropped.capped === 0 && capped.dropped.backfilled === 0,
+    `v0.9.1: 名额被填满时不谎报挡掉条数（capped=${capped.dropped.capped} backfilled=${capped.dropped.backfilled}）`,
+  );
+  //    名额铺不满时回填 —— 结果本来就少，不能因为配额而更少。回填数要如实对上。
+  const filled = host.searchMemory("capquery", { limit: 20 });
+  check(
+    filled.results.length === 7 && filled.dropped.capped === 3 && filled.dropped.backfilled === 3,
+    `v0.9.1: limit 铺不满时放宽配额回填，capped/backfilled 对得上（${filled.results.length} 条，capped=${filled.dropped.capped} 回填=${filled.dropped.backfilled}）`,
+  );
+  // ③ 作用域：默认只检全局层 + cwd 所属项目层；其它项目要 scope:"all" 才进来。
+  writeFileSync(join(HOME, ".dsh/memory/projects", `${SINGLE_SLUG}.md`), "- [2026-05-05] zxotherprojmarkeralpha zzzbetaterm\n");
+  const inScope = host.searchMemory("probe project index entry", { cwd: CWD, limit: 20 });
+  check(
+    inScope.scanned.scope === "current" && inScope.results.some((r) => r.path.includes(SLUG)) && inScope.dropped.offScopeLayers > 0,
+    `v0.9.1: scope=current 命中当前项目层并上报跳过的层数（scope=${inScope.scanned.scope} 跳过=${inScope.dropped.offScopeLayers}）`,
+  );
+  const outScope = host.searchMemory("zxotherprojmarkeralpha zzzbetaterm", { cwd: CWD, limit: 20 });
+  const allScope = host.searchMemory("zxotherprojmarkeralpha zzzbetaterm", { cwd: CWD, scope: "all", limit: 20 });
+  check(
+    outScope.results.length === 0 && allScope.results.some((r) => r.path.includes(SINGLE_SLUG)),
+    `v0.9.1: 别的项目默认搜不到、scope:"all" 才搜得到（current=${outScope.results.length} all=${allScope.results.length}）`,
+  );
+  const noCwd = host.searchMemory("zxotherprojmarkeralpha zzzbetaterm", { limit: 20 });
+  check(
+    noCwd.scanned.scope === "all" && noCwd.results.some((r) => r.path.includes(SINGLE_SLUG)),
+    `v0.9.1: cwd 缺失退化为全库（兼容既有单参调用，不破 v0.8 断言）`,
+  );
+  //    少给的结果必须可见：作用域提示要进 render 文案。
+  check(
+    host.formatSearchResults(inScope).includes("作用域=当前项目层") && host.formatSearchResults(inScope).includes("scope:\"all\""),
+    "v0.9.1: render 文案上报作用域与跨项目出路（不静默少给）",
+  );
+  check(
+    host.formatSearchResults(outScope).includes("作用域=当前项目层"),
+    "v0.9.1: 无命中时也说明是作用域所致",
+  );
+
+  // ── v0.9.2 P1：IDF 加权 / 碎片剔出分母 / 长度归一 / 锚点预览 ──────────────────
+  // ① IDF：同各命中 1 个 token，稀有词条目必须压过常见词条目（旧版一律 +1 → 两者同分）。
+  writeFileSync(
+    join(TOPICS, "p1-idf.md"),
+    `# idf probe\n${Array.from({ length: 6 }, (_, i) => `- [2026-06-02] zzcommonterm filler line ${i}\n`).join("")}- [2026-06-03] zzzareterm filler line x\n`,
+  );
+  const idfProbe = host.searchMemory("zzcommonterm zzzareterm", { limit: 20 });
+  const rareHit = idfProbe.results.find((r) => r.text.includes("zzzareterm"));
+  const commonBest = idfProbe.results.filter((r) => r.text.includes("zzcommonterm")).sort((a, b) => b.score - a.score)[0];
+  check(
+    rareHit && commonBest && rareHit.score > commonBest.score,
+    `v0.9.2: IDF 让稀有词条目压过常见词条目（稀有=${rareHit?.score} 常见=${commonBest?.score}）`,
+  );
+  // ② df=0 的跨词碎片必须**剔出门槛分母**：旧版把 5 个 token 全计分母 → ⌈5/4⌉=2，
+  //    只命中 1 个真词的条目被误毙；现在分母只数有效 token → 该条目应能出来。
+  const fragOnly = host.searchMemory("zzrealword zzzalphafrag zzzbetafrag zzzgammafrag zzzdeltafrag", { limit: 20 });
+  check(
+    fragOnly.scanned.entries > 0 && fragOnly.results.length === 0,
+    `v0.9.2: 全碎片 query 返回空且不炸（results=${fragOnly.results.length}）`,
+  );
+  writeFileSync(join(TOPICS, "p1-frag.md"), "# frag probe\n- [2026-06-06] zzrealword appears once here\n");
+  const fragMixed = host.searchMemory("zzrealword zzzalphafrag zzzbetafrag zzzgammafrag zzzdeltafrag", { limit: 20 });
+  check(
+    fragMixed.results.some((r) => r.text.includes("zzrealword")),
+    `v0.9.2: 碎片不计入门槛分母，命中 1 个有效 token 的条目不再被误毙（results=${fragMixed.results.length}）`,
+  );
+  // ③ 长度归一：同命中 1 个 token，短条目分数必须高于长条目（长条目的命中数是「免费的」）。
+  writeFileSync(
+    join(TOPICS, "p1-len.md"),
+    `# len probe\n- [2026-06-07] zzlenprobe short entry\n- [2026-06-08] zzlenprobe ${"padding ".repeat(120)}long entry\n`,
+  );
+  const lenProbe = host.searchMemory("zzlenprobe", { limit: 20 });
+  const shortHit = lenProbe.results.find((r) => r.text.includes("short entry"));
+  const longHit = lenProbe.results.find((r) => r.text.includes("padding"));
+  check(
+    shortHit && longHit && shortHit.score > longHit.score,
+    `v0.9.2: 长度归一压掉长条目分数（短=${shortHit?.score} > 长=${longHit?.score}）`,
+  );
+  // ④ 锚点预览：命中词落在 240 字符窗口之外时预览必须端上来（旧版一律从头截 → 实测 48% 盲预览）。
+  writeFileSync(
+    join(TOPICS, "p1-preview.md"),
+    `# preview probe\n- [2026-06-09] ${"filler words ".repeat(40)}zzdeepanchor tail\n`,
+  );
+  const pvProbe = host.searchMemory("zzdeepanchor", { limit: 5 });
+  const pvHit = pvProbe.results.find((r) => r.path.endsWith("p1-preview.md"));
+  check(pvHit && pvHit.text.includes("zzdeepanchor"), "v0.9.2: 预览窗口定位到命中锚点（旧版从头截会丢掉第 480 字符后的命中词）");
+  check(pvHit && pvHit.text.startsWith("…"), `v0.9.2: 窗口不在条目开头时带省略号（实际起头 ${JSON.stringify(pvHit?.text.slice(0, 3))}）`);
 
   // 回合记忆活动投影：read/grep 命中记账、deny 不计、非记忆路径不记、增量与 reset
   const TOPIC = `${HOME}/.dsh/memory/topics/probe-shard.md`;
@@ -942,7 +1065,7 @@ store.writeHookCommand = "";
   const bashGlobal = await pre({ name: "bash", agent: { id: SESSION }, arguments: { command: "echo x >> ~/.dsh/memory/topics/foo.md" } }, passNext);
   check(bashGlobal.kind === "deny", "card: 召唤中 bash 写全局记忆 → deny（不给 ask）");
   const bashNormal = await pre({ name: "bash", agent: { id: "sess-probe-agent" }, arguments: { command: "echo x >> ~/.dsh/memory/topics/foo.md" } }, passNext);
-  check(bashNormal.kind === "ask", "card: 非召唤 bash 写记忆维持 ask");
+  check(bashNormal === NEXT_PASSED, "card: 非召唤 bash 写记忆直接放行（bash-ask 已停用）");
 
   // 清除路由：列表 + 删除（带头 / 不带头 / 坏 slug / 正常删）
   const listJson = await callRoute(fakeReq({ method: "GET" }));

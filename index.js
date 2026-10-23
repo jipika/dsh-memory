@@ -213,6 +213,55 @@ const SHARD_WARN_CHARS = 12000;
 const ENTRY_WARN_CHARS = 400;
 
 /**
+ * 检索时**片级**线索的加分上限（整句命中片名 3 / 命中关键词 2 / 否则 0）。
+ *
+ * 它只作**同分 tie-break**，不参与条目分本身 —— 旧实现把这套加分加在每条 entry 上
+ * （v0.9.0 的 `phraseShard` + 每 token 片名+4/关键词+2 写在 entry 循环内），
+ * 于是同一片所有命中条目**分数完全相同**，排序退化成「日期 → 行号」。
+ * 取值域是 {3,2,0}，天然 ≤3，无需再 `Math.min` 封顶（那是死代码）。
+ */
+const SHARD_BONUS_PHRASE = 3;
+const SHARD_BONUS_KEYWORD = 2;
+
+/** 检索结果里**单个分片**最多占几条（防一片霸屏：实测旧版 8/8 全来自同一片）。 */
+const PER_SHARD_MAX = 2;
+
+/** 检索预览的字符数与窗口锚点两侧的余量。 */
+const SEARCH_PREVIEW_CHARS = 240;
+const SEARCH_PREVIEW_PAD = 80;
+
+/**
+ * 检索打分的**长度归一强度**：`score / (1 + b·(len/avgLen − 1))`。
+ * 动机：token 命中数是「免费的」—— 条目越长命中越多、分数虚高（实测一条 808 字符的
+ * 诊断条目几乎霸榜所有 query）。b=0.5 实测把最大同分块从 3.13 压到 1.13、覆盖片升到 5.50。
+ * 分母下限是 `1 − b`（b=0.5 时为 0.5，对 len≥0 恒成立，clamp 只是给调大 b 的人兜底）。
+ */
+const SEARCH_LENGTH_B = 0.5;
+
+/**
+ * 检索预览：定位到**最稀有**的命中 token 附近取一段窗口，而不是一律从条目开头截 ——
+ * 实测 90% 的条目超 240 字符，从头截会把命中句整段丢掉（48% 的预览一个命中词都没有），
+ * 模型据此无法判断「这条为什么命中」，只能整片 read。
+ * 锚点按 idf 从高到低依次试：归一化命中的 token 在原文上 `indexOf` 可能失配
+ * （大小写差异，如原文 `Advisor` vs 归一化 `advisor`），全部失配才退回条目开头 ——
+ * 这是健壮性兜底，不是换选锚策略。
+ * @param {string} flat - 条目原文（只把连续空白折成单空格）。
+ * @param {string[]} anchorTokens - 该条目命中的有效 token，按 idf 降序。
+ * @returns {string} 预览文本。
+ */
+function searchPreview(flat, anchorTokens) {
+  const lower = flat.toLocaleLowerCase();
+  for (const t of anchorTokens) {
+    const pos = lower.indexOf(t);
+    if (pos < 0) continue;
+    const start = Math.max(0, pos - SEARCH_PREVIEW_PAD);
+    const end = Math.min(flat.length, start + SEARCH_PREVIEW_CHARS);
+    return `${start > 0 ? "…" : ""}${flat.slice(start, end)}${end < flat.length ? "…" : ""}`;
+  }
+  return flat.slice(0, SEARCH_PREVIEW_CHARS);
+}
+
+/**
  * 注入索引的**默认**字符预算（设置项 `indexBudget` 可改；0 = 不限制）。
  *
  * 历史：该值原为硬编码 9000，是「10 片 / 90 条」时代的取值。分片长到 27 片 / 285 条后，
@@ -822,11 +871,28 @@ function entryRows(text) {
 
 /**
  * 全库检索：全局层 + 项目层，条目级打分排序。
- * 打分：整句命中 片名+12 / 关键词+7 / 条目+4；每 token 命中 片名+4 / 关键词+2 / 条目+1；
- * 覆盖度不足或零分的条目剔除；同分按条目内日期新者优先。
+ *
+ * v0.9.1 的三点改动（针对「命中几百条、top 里分不清主次」）：
+ * ① **片级加分挪出条目循环** —— 旧实现把 `phraseShard`（片名+12/关键词+7）与每 token 的
+ *   片名+4/关键词+2 写在 entry 循环**内部**，它们与条目内容无关，于是**同一片所有命中条目
+ *   分数完全相同**，排序退化成「日期 → 行号」；现在片级只作同分 tie-break（见 [SHARD_BONUS_PHRASE]）。
+ *   连带修正：`hitTokens` 旧版先把「片名/关键词里出现的 token」塞进去（:880-883 那段），
+ *   等于片级线索能单独满足覆盖度门槛、架空条目级判定；现在 hitTokens **只由条目内容贡献**。
+ * ② **per-shard 配额**（[PER_SHARD_MAX]）—— 旧 `slice(0, limit)` 让一片吃掉全部名额
+ *   （实测 8/8 全来自同一片）；现在每片最多占 2 条，铺不满 limit 时再放宽回填，
+ *   保证「结果本来就少」时不会因为配额而更少。
+ * ③ **作用域**（`options.scope`）—— 旧实现扫 projects/ 下**全部** slug，本机其它项目
+ *   216 片 / 2028 条占池 60%，却不在地图里、模型无从路由，实测 top8 能被别的项目 8/8 占满。
+ *   默认 `current` = 全局层 + `cwd` 所属项目层；`cwd` 取不到（探针直调、无会话上下文）
+ *   或显式 `scope:"all"` → 退回全库，既有调用方行为不变。
+ *   **少给的结果必须可见**：被跳过的层/片数进 `dropped` 并由 [formatSearchResults] 渲染出来。
+ *
+ * 打分：条目分 = 整句命中条目 +4 ＋ 每命中 token +1（只算条目正文）；
+ * 覆盖度不足或零分的条目剔除；同分依次按 片级 tie-break → 日期新 → 行号。
  * @param {string} query - 查询串。
- * @param {{limit?:number}} [options] - limit 默认 8，上限 20。
- * @returns {{ok:true,query:string,results:object[],scanned:{files:number,entries:number},totalHits:number}|{ok:false,error:string}}
+ * @param {{limit?:number,scope?:string,cwd?:string}} [options] - limit 默认 8（上限 20）；
+ *   scope `"current"`（默认）| `"all"`；cwd 缺失时自动退化为 `"all"`。
+ * @returns {{ok:true,query:string,results:object[],scanned:{files:number,entries:number,scope:string},totalHits:number,dropped:{capped:number,backfilled:number,offScopeLayers:number,offScopeFiles:number}}|{ok:false,error:string}}
  */
 function searchMemory(query, options = {}) {
   const raw = String(query ?? "").trim();
@@ -834,7 +900,12 @@ function searchMemory(query, options = {}) {
   const limit = Math.max(1, Math.min(20, Math.trunc(options.limit ?? 8)));
   const normalized = raw.normalize("NFKC").toLocaleLowerCase();
   const tokens = lexicalSearchTokens(normalized);
-  const required = lexicalRequiredMatchCount(tokens);
+  // required 到 pass2 才算：要先有 df 才能剔出跨词碎片（见下方 validTokens）。
+
+  const cwd = typeof options.cwd === "string" ? options.cwd.trim() : "";
+  // cwd 未知时不猜：宁可扫全库（＝旧行为），也不要静默少给结果。
+  const scoped = options.scope !== "all" && cwd !== "";
+  const currentSlug = scoped ? slugOf(cwd) : "";
 
   const files = [];
   for (const f of layerFiles(TOPICS_DIR, GLOBAL_MEMORY)) files.push({ ...f, layer: "global" });
@@ -843,9 +914,25 @@ function searchMemory(query, options = {}) {
   if (existsSync(GLOBAL_MEMORY) && !files.some((f) => f.path === GLOBAL_MEMORY)) {
     files.push({ name: "memory.md", path: GLOBAL_MEMORY, layer: "global" });
   }
+  let offScopeLayers = 0;
+  let offScopeFiles = 0;
   for (const slug of listProjectSlugs()) {
     const dir = `${PROJECT_DIR}/${slug}`;
     const single = `${PROJECT_DIR}/${slug}.md`;
+    if (scoped && slug !== currentSlug) {
+      // 只数不读：内容都不进内存，多记一次 readdir 换「少给了多少」的可见性。
+      offScopeLayers += 1;
+      try {
+        offScopeFiles += isDir(dir)
+          ? readdirSync(dir).filter((n) => n.endsWith(".md")).length
+          : existsSync(single)
+            ? 1
+            : 0;
+      } catch {
+        /* 数不出来就算了，不影响检索 */
+      }
+      continue;
+    }
     if (isDir(dir)) {
       for (const f of layerFiles(dir, "")) files.push({ ...f, layer: `project:${slug}` });
     } else if (existsSync(single)) {
@@ -853,68 +940,155 @@ function searchMemory(query, options = {}) {
     }
   }
 
-  const results = [];
+  // ── pass1：收池内全部条目，同时统计每个 token 的 df 与平均条目长度 ──────────
+  // df/avgLen 与 pass2 必须用**同一个 scoring pool**（上面 scope 过滤后的 files），
+  // 否则 idf 的 N 与实际语料不一致，稀有度不可比。
+  const rows = [];
+  const df = new Array(tokens.length).fill(0);
+  let totalLen = 0;
   let scannedEntries = 0;
   for (const f of files) {
     const text = readOrEmpty(f.path);
     if (!text.trim()) continue;
     const name = shardName(text, f.name);
-    const keywords = shardKeywords(text, name);
     const nName = name.normalize("NFKC").toLocaleLowerCase();
-    const nKeywords = keywords.normalize("NFKC").toLocaleLowerCase();
-    const phraseShard = nName.includes(normalized) ? 12 : nKeywords.includes(normalized) ? 7 : 0;
-    const hitTokens = new Set();
-    for (const t of tokens) {
-      if (nName.includes(t) || nKeywords.includes(t)) hitTokens.add(t);
-    }
+    const nKeywords = shardKeywords(text, name).normalize("NFKC").toLocaleLowerCase();
+    // 片级线索：**循环外**算一次，只用于同分 tie-break，不进条目分、不进覆盖判定。
+    const shardBonus = nName.includes(normalized)
+      ? SHARD_BONUS_PHRASE
+      : nKeywords.includes(normalized)
+        ? SHARD_BONUS_KEYWORD
+        : 0;
     for (const entry of entryRows(text)) {
       scannedEntries += 1;
       const nEntry = entry.text.normalize("NFKC").toLocaleLowerCase();
-      let score = phraseShard;
-      if (nEntry.includes(normalized)) score += 4;
-      for (const t of tokens) {
-        if (nName.includes(t)) score += 4;
-        else if (nKeywords.includes(t)) score += 2;
-        if (nEntry.includes(t)) {
-          score += 1;
-          hitTokens.add(t);
-        }
-      }
-      const covered = tokens.length === 0 ? score > 0 || nEntry.includes(normalized) : hitTokens.size >= required;
-      if (score <= 0 || !covered) continue;
-      const date = (entry.text.match(/\[(\d{4}-\d{2}-\d{2})\]/) ?? [])[1] ?? "";
-      results.push({
+      const hitIdx = [];
+      for (let i = 0; i < tokens.length; i++) if (nEntry.includes(tokens[i])) hitIdx.push(i);
+      for (const i of hitIdx) df[i] += 1;
+      totalLen += nEntry.length;
+      rows.push({
         path: f.path,
         shard: name,
         layer: f.layer,
         line: entry.line,
-        date,
-        score,
-        text: entry.text.replace(/\s+/g, " ").slice(0, 240),
+        date: (entry.text.match(/\[(\d{4}-\d{2}-\d{2})\]/) ?? [])[1] ?? "",
+        norm: nEntry,
+        flat: entry.text.replace(/\s+/g, " "),
+        hitIdx,
+        exact: nEntry.includes(normalized),
+        shardBonus,
       });
     }
   }
-  results.sort((a, b) => b.score - a.score || (b.date || "").localeCompare(a.date || "") || a.line - b.line);
+
+  // ── pass2：IDF 加权打分 + 长度归一 + 锚点预览 ─────────────────────────────
+  // df=0 的 token 是中文 bigram 的跨词碎片（「盘空」「索历」，语料里不存在），权重记 0
+  // 并**剔出覆盖门槛的分母** —— 旧实现把它们计入 token 数，门槛虚高。
+  const poolSize = rows.length;
+  const weight = tokens.map((t, i) => (df[i] > 0 ? Math.log(1 + poolSize / df[i]) : 0));
+  const validTokens = [];
+  for (let i = 0; i < tokens.length; i++) if (weight[i] > 0) validTokens.push(tokens[i]);
+  // 门槛只改**输入**不改 lexicalRequiredMatchCount 本体；valid=0（query 全是碎片）时显式取 1，
+  // 让整句命中仍能放行（下面用 validTokens.length > 0 兜住 anchors 恒空的情况）。
+  const required = validTokens.length === 0 ? 1 : lexicalRequiredMatchCount(validTokens);
+  const avgLen = poolSize > 0 ? totalLen / poolSize : 1;
+  const phraseWeight = Math.log(1 + poolSize);
+
+  const results = [];
+  for (const r of rows) {
+    let score = 0;
+    const anchors = [];
+    for (const i of r.hitIdx) {
+      if (weight[i] > 0) {
+        score += weight[i];
+        anchors.push(i);
+      }
+    }
+    if (r.exact) score += phraseWeight;
+    if (score <= 0) continue;
+    if (validTokens.length > 0 && anchors.length < required) continue;
+    // 长度归一：压掉长条目「命中 token 数天然更多」的分数优势。
+    // 分母下限 1−b 对 len≥0 恒成立（b=0.5 时 0.5），写明是为了给调大 b 的人看。
+    const denom = Math.max(1 - SEARCH_LENGTH_B, 1 + SEARCH_LENGTH_B * (r.norm.length / avgLen - 1));
+    anchors.sort((a, b) => weight[b] - weight[a]);
+    results.push({
+      path: r.path,
+      shard: r.shard,
+      layer: r.layer,
+      line: r.line,
+      date: r.date,
+      score: +(score / denom).toFixed(4),
+      shardBonus: r.shardBonus,
+      text: searchPreview(r.flat, anchors.map((i) => tokens[i])),
+    });
+  }
+  const compare = (a, b) =>
+    b.score - a.score ||
+    b.shardBonus - a.shardBonus ||
+    (b.date || "").localeCompare(a.date || "") ||
+    a.line - b.line;
+  results.sort(compare);
+
+  // ② per-shard 配额：先按每片 ≤PER_SHARD_MAX 铺，不够 limit 再放宽回填。
+  // 已知语义（不是缺陷）：命中只来自一两片时，回填会让那片重新占满名额 ——
+  // 宁多勿少，好过把「本来只有这些」的结果砍得更少。所以 capped 要和 backfilled 一起看。
+  const perPath = new Map();
+  const picked = [];
+  let capped = 0;
+  for (const r of results) {
+    const used = perPath.get(r.path) ?? 0;
+    if (used >= PER_SHARD_MAX) {
+      capped += 1;
+      continue;
+    }
+    perPath.set(r.path, used + 1);
+    picked.push(r);
+    if (picked.length >= limit) break;
+  }
+  let backfilled = 0;
+  if (picked.length < limit) {
+    // 名额铺不满时放宽配额回填 —— 否则「结果本来就少」会因为配额而更少。
+    // 回填的条目会从 capped 里捡回来，所以两个数都要报，不能只报 capped。
+    const seen = new Set(picked);
+    for (const r of results) {
+      if (picked.length >= limit) break;
+      if (seen.has(r)) continue;
+      seen.add(r);
+      picked.push(r);
+      backfilled += 1;
+    }
+  }
+  picked.sort(compare);
   return {
     ok: true,
     query: raw,
-    results: results.slice(0, limit),
-    scanned: { files: files.length, entries: scannedEntries },
+    results: picked,
+    scanned: { files: files.length, entries: scannedEntries, scope: scoped ? "current" : "all" },
     totalHits: results.length,
+    dropped: { capped, backfilled, offScopeLayers, offScopeFiles },
   };
 }
 
 /** 把检索结果渲染成模型可读文本（工具 output.render 用）。 */
 function formatSearchResults(value) {
   if (!value || value.ok !== true) return `memory_search 失败：${value?.error ?? "unknown"}`;
+  // 「少给了多少」必须可见：默认作用域只扫当前项目层，跨项目的东西不写出来就像凭空消失。
+  const scopeNote =
+    value.scanned.scope === "current"
+      ? `；作用域=当前项目层（已跳过其它项目 ${value.dropped?.offScopeLayers ?? 0} 层 / ${value.dropped?.offScopeFiles ?? 0} 片，要跨项目搜就带 scope:"all"）`
+      : "";
+  const capNote =
+    value.dropped?.capped > 0
+      ? `；每片限 ${PER_SHARD_MAX} 条，挡 ${value.dropped.capped} 条（其中 ${value.dropped.backfilled ?? 0} 条因名额没铺满已回填）`
+      : "";
   if (value.results.length === 0) {
-    return `memory_search：无命中（扫描 ${value.scanned.files} 个文件 / ${value.scanned.entries} 条条目）。换关键词重试，或用 grep 做精确正则。`;
+    return `memory_search：无命中（扫描 ${value.scanned.files} 个文件 / ${value.scanned.entries} 条条目${scopeNote}）。换关键词重试，或用 grep 做精确正则；要找别的项目的记忆就带 scope:"all"。`;
   }
   const rows = value.results.map(
     (r, i) => `${i + 1}. [score ${r.score}] ${r.path}:${r.line}${r.date ? ` [${r.date}]` : ""}\n   ${r.text}`,
   );
   return [
-    `memory_search：共 ${value.totalHits} 条命中（显示前 ${value.results.length} 条；扫描 ${value.scanned.files} 文件 / ${value.scanned.entries} 条目），按相关度排序。`,
+    `memory_search：共 ${value.totalHits} 条命中（显示前 ${value.results.length} 条；扫描 ${value.scanned.files} 文件 / ${value.scanned.entries} 条目${scopeNote}${capNote}），按相关度排序。`,
     ...rows,
     "→ read 对应文件的行号取上下文；条目行号即记忆纪律里的 L 号。",
   ].join("\n");
@@ -2160,11 +2334,31 @@ async function writeGuardHook(exec, next) {
         };
       }
     } else {
-      // 非召唤：维持原「保守转人工确认」。
-      decided = {
-        decision: "ask",
-        reason: "dsh-memory write-guard：这条 shell 命令看起来会改动记忆文件（重定向/tee/sed -i）。请确认；能用 write/edit 工具时优先用工具 —— 会经过完整格式与敏感信息校验。",
-      };
+      // 非召唤：直接放行（2026-10-23 用户决定：不要「转人工确认」）。
+      // 但放行 ≠ 免检：命令文本里的凭据字面量（echo sk-xxx >> 记忆）在这里
+      // 落盘前 deny —— 与 write/edit 的凭据红线同一条。只报 pattern 名，
+      // 不回显命中值。范围受外层 bashTouchesMemory 限定：只有真的写向记忆
+      // 路径的命令才会进到这里，写 /tmp 等无关目标不受影响。
+      // 已知边界（刻意不做）：命令经变量/heredoc/脚本解释器间接写凭据时
+      // 文本里看不见，post-execute 落盘校验未实现（并发/CRLF/无基线快照的
+      // 复杂度收益比不划算）；writeGuard=off 可整体停用本钩子。
+      const secretHits = scanSecrets(normalizeCommandText(exec.arguments?.command));
+      if (secretHits.length > 0) {
+        const listed = [...new Set(secretHits.map((s) => s.pattern))].slice(0, 4).join("；");
+        decided = {
+          decision: "deny",
+          reason:
+            `dsh-memory write-guard：这条 shell 命令疑似包含凭据（${listed}），禁止写进记忆 —— 记忆会随每次请求注入并离开本机。` +
+            "把值写进普通文件或环境变量，记忆里只允许写「凭据存放在哪里」这类指针。",
+        };
+      }
+      // 审计里记一条 allow，路径可追溯。
+      auditLog({
+        event: "pre-execute",
+        tool: "bash",
+        decision: "allow",
+        notes: ["shell 写记忆放行（write-guard bash-ask 已按用户要求停用）"],
+      });
     }
   }
 
@@ -2274,7 +2468,7 @@ const DISCIPLINE_TAIL = [
   "     · 【写入判据】值得记：可复用的结论、用户偏好、坑与成因；不值得记：过程叙述、能从仓库或 git 推导的内容、一次性中间状态",
   "     · 条目格式 `- [YYYY-MM-DD] 事实`；全局层写 ~/.dsh/memory/topics/ 分片（**新片首行写 `<!-- 片名 · 关键词… -->`**，关键词会进索引供路由），项目层写对应文件并登记 MEMORY.md；某片出现 ⚠️超建议 时按子主题就地拆片",
   "     · 同一事实有了新结论就**就地改写那一行**（不追加第二条、不写「已改为」的变迁史）；发现过时条目就地修正",
-  "     · 写入动作由钩子校验：格式错/含凭据/覆盖历史 → 直接拒绝（deny，原因会回到你面前）；可疑改动 → 转人工确认（ask）",
+  "     · 写入动作由钩子校验：格式错/含凭据/覆盖历史 → 直接拒绝（deny，原因会回到你面前）；shell 写记忆不转人工，凭据字面量同样落盘前 deny",
 ];
 
 /**
@@ -2773,6 +2967,12 @@ export function apply(ctx) {
             properties: {
               query: { type: "string", description: "检索词（中文/英文/混合，越具体越好）" },
               limit: { type: "integer", description: "返回条数上限，默认 8，最大 20" },
+              scope: {
+                type: "string",
+                enum: ["current", "all"],
+                description:
+                  "检索范围：current（默认）= 全局分片 + 当前项目记忆；all = 连其它项目的记忆一起搜（跨项目排查、找「好像在别的仓库记过」时用）",
+              },
             },
             required: ["query"],
           },
@@ -2780,9 +2980,18 @@ export function apply(ctx) {
             schema: { type: "object", additionalProperties: true },
             render: (_args, value) => [{ type: "text", text: formatSearchResults(value) }],
           },
-          execute: async (args) => {
+          // exec.agent 是宿主契约（packages/core/tools/src/index.ts:340「The agent on whose
+          // behalf the call runs」，可选字段）；cwd 走 compose() 同一条链
+          // （agent.session.header.cwd，packages/core/session/src/types.ts:106）。
+          // 任一环取不到 → cwd 为空串 → searchMemory 自动退回全库，绝不静默少给。
+          execute: async (args, exec) => {
             const limit = Number.isFinite(args?.limit) ? args.limit : undefined;
-            return searchMemory(String(args?.query ?? ""), { limit });
+            const cwd = exec?.agent?.session?.header?.cwd;
+            return searchMemory(String(args?.query ?? ""), {
+              limit,
+              scope: args?.scope === "all" ? "all" : undefined,
+              cwd: typeof cwd === "string" ? cwd : "",
+            });
           },
         }),
       "dsh-memory: memory_search tool",
