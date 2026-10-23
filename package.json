@@ -25,7 +25,8 @@
     "cordis.patch.yml",
     "tools",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "assets"
   ],
   "keywords": [
     "dsh",
