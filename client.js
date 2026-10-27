@@ -15,6 +15,16 @@
         var react = require("react");
         var inject = ["slots"];
 
+        /* 注入档位白名单（v0.9.4）。
+           ⚠ 必须与 host 半 index.js 的 normalizeInjectMode() 逐字一致 —— 那份是 host 唯一的
+           归一入口，本包历史上把同样的三元链抄了三处（host 1 + client 2），加新档只改一处就会
+           出现「面板显示旧档、host 按新档跑」的静默漂移。client 不能 import host（宿主语义不同），
+           所以这里收成**一个函数**供本文件两处调用，把重复降到最少。 */
+        var INJECT_MODES = ["map", "mapless", "index", "full"];
+        function normInjectMode(raw) {
+          return INJECT_MODES.indexOf(raw) >= 0 ? raw : "map";
+        }
+
         var STYLE_ID = "dsh-memory-style";
         var CSS = [
           ".dm-pane{display:flex;flex-direction:column;gap:14px;width:100%;max-width:760px;padding:4px 0 24px;color:var(--dsw-alias-label-primary)}",
@@ -128,7 +138,8 @@
                 projectEnabled: v.projectEnabled !== null && typeof v.projectEnabled === "object" ? v.projectEnabled : {},
                 // 必须带上：漏掉它会让面板永久回落到默认值，档位与输入框都不跟着设置走。
                 maxChars: Number.isFinite(v.maxChars) ? Math.max(0, Math.floor(v.maxChars)) : 24000,
-                injectMode: v.injectMode === "full" ? "full" : v.injectMode === "index" ? "index" : "map",
+                // 档位归一走本文件顶部的 normInjectMode()（与 host 的 normalizeInjectMode 同表）。
+                injectMode: normInjectMode(v.injectMode),
                 // 索引模式的预算：漏掉它 → 面板档位永远回落默认（这条踩过两次，见 memory-system 分片）
                 indexBudget: Number.isFinite(v.indexBudget) ? Math.max(0, Math.floor(v.indexBudget)) : 12000,
                 // 钩子子系统字段：同样必须进快照，否则设置里改了也会被这里洗回默认值。
@@ -262,7 +273,7 @@
           var projectEnabled = value.projectEnabled || {};
           var known = Array.isArray(snap.projects) ? snap.projects : [];
           var maxCharsValue = Number.isFinite(value.maxChars) ? value.maxChars : 24000;
-          var injectModeValue = value.injectMode === "full" ? "full" : value.injectMode === "index" ? "index" : "map";
+          var injectModeValue = normInjectMode(value.injectMode);
           var indexBudgetValue = Number.isFinite(value.indexBudget) ? value.indexBudget : 12000;
           // 钩子子系统（host 半归一化的同名字段；这里只读值渲染 UI）
           var writeGuardValue = value.writeGuard === "off" || value.writeGuard === "full" ? value.writeGuard : "rules";
@@ -422,6 +433,12 @@
               ? (function () {
                   var n = (file.text || "").length;
                   // 索引模式注入的是索引、不是这份正文 —— 用 maxChars 口径描述会误导
+                  // mapless：只有**全局层**不注入（吃掉 token 的是那 188 片地图）；
+                  // 项目层照旧走 map 的渲染路径，所以不能一句「本层不注入」把两层说死。
+                  if (injectModeValue === "mapless" && target === "global") {
+                    return n + " 字符 · 无地图注入（提示词里只留一段固定指针，片级线索看 memory_search 返回的「相关记忆片」）";
+                  }
+                  if (injectModeValue === "mapless") return n + " 字符 · 项目层照旧注入（本档只砍全局层地图）";
                   if (injectModeValue === "map") return n + " 字符 · 地图模式（只进片级地图，条目按需 memory_search + read）";
                   if (injectModeValue === "index") return n + " 字符 · 索引模式（正文按需 read，上表只进片级索引）";
                   if (maxCharsValue <= 0) return n + " 字符 · 全量注入";
@@ -634,13 +651,15 @@
                 { className: "dm-limit-desc" },
                 "地图模式（默认）：提示词里只放**片级地图** —— 片名 · 关键词 · 条数 · 体量 · 最新日期；条目标题与正文都不进提示词，模型先调 memory_search 取线索、按命中行号 read，无命中或要精确正则时才 grep 记忆目录。" +
                   "条目 ≤ 12 条的层（典型是项目层单文件）仍逐条内联，省掉一次检索。" +
+                  "无地图（按需检索）：全局层地图**完全不进提示词**，只留一段固定指针；片级线索改由 memory_search 每次按 query 现算（返回里的「相关记忆片」top8）。" +
+                  "提示词长度与记忆片数无关、也不因写记忆而作废 KV 缓存 —— 记忆越多越省（实测本机 188 片时地图约 3.9 万字符）。项目层仍照旧注入。" +
                   "索引模式：地图 + 每片最新 N 条「标题 · 行号」，受「索引预算」约束 —— 预算装不下全量逐条时按片收缩为「每片最新 N 条」，不会整层变成空目录。" +
                   "全文注入：把分片正文整篇放进提示词；分片总量超过「正文上限」时自动回退索引模式（分片规模下通常都会回退）。",
               ),
               react.createElement(
                 "div",
                 { className: "dm-chips" },
-                [["map", "地图模式（默认）"], ["index", "索引模式"], ["full", "全文注入"]].map(function (pair) {
+                [["map", "地图模式（默认）"], ["mapless", "无地图（按需检索）"], ["index", "索引模式"], ["full", "全文注入"]].map(function (pair) {
                   return react.createElement(
                     "button",
                     {

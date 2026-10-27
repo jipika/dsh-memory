@@ -265,6 +265,109 @@ check(
   "map: 小层内联时头注释仍标「地图模式」，同一份注入里不混两套档位名",
 );
 check(!at(CWD).includes("索引模式"), "map: 地图模式下不会混入「索引模式」措辞（子代理曾因此以为有两套检索方式）");
+
+// ── v0.9.4 mapless：全局地图不常驻，片级线索改由 memory_search 现算「桥」──────────
+check(host.normalizeInjectMode("mapless") === "mapless", "mapless: 新档被识别（不被原三元链吞成 map）");
+check(host.normalizeInjectMode("bogus") === "map", "mapless: 非法档位回落 map");
+check(host.normalizeInjectMode(undefined) === "map", "mapless: 缺省 = map（默认档不变）");
+check(host.normalizeSettings({}).injectMode === "map", "mapless: 默认档仍是 map（本次只加档，不改默认）");
+check(host.normalizeSettings({ injectMode: "mapless" }).injectMode === "mapless", "mapless: 设置层认这个档");
+// 档位白名单过去是同一条三元链抄三处（host 1 + client 2），加新档改漏一处就静默漂移。
+// 现在 host 收进 normalizeInjectMode()、client 收进 INJECT_MODES，这条断言钉住两份表**必须一致**。
+const clientSrc = readFileSync(new URL("../client.js", import.meta.url), "utf8");
+const modesMatch = clientSrc.match(/var INJECT_MODES = \[([^\]]*)\]/);
+check(!!modesMatch, "档位表: client.js 存在 INJECT_MODES 白名单（不许再退回散落的三元链）");
+const clientModes = modesMatch ? modesMatch[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean) : [];
+check(
+  clientModes.every((x) => host.normalizeInjectMode(x) === x),
+  `档位表: host 认 client 列出的每一个档位（client = ${clientModes.join("/")}）`,
+);
+check(
+  ["map", "mapless", "index", "full"].every((x) => clientModes.includes(x)),
+  `档位表: 四档在 client 齐全（实际 ${clientModes.join("/")}）—— 新增档位必须同时出现在这里`,
+);
+check(!/injectMode === "index" \? "index" : "map"/.test(clientSrc), "档位表: client 两处调用点都改走 normInjectMode()");
+
+store.injectMode = "mapless";
+const less = at(CWD);
+check(less.includes("全局记忆") && less.includes("memory_search"), "mapless: 注入指针块（告诉模型有记忆、怎么搜）");
+check(!less.includes("## 探针分片"), "mapless: 全局层片级地图不注入（不列片名行）");
+check(!less.includes("记忆**没有**常驻索引"), "mapless: 指针块不用全称否定（项目层可能自带地图，全称必与它打脸）");
+check(!/- \[L\d+\]/.test(less), "mapless: 没有常驻条目行号表");
+check(less.includes("~/.dsh/memory/topics"), "mapless: 给出全局层根目录（否则模型写记忆时无路可循）");
+check(less.includes("probe project index entry"), "mapless: 项目层照旧注入（只有几条且是人写摘要，砍它不划算）");
+check(
+  less.length < 2600,
+  `mapless: 注入长度与全局记忆规模无关 = 本档存在理由（实际 ${less.length} 字符，含纪律块；对照 map 档随片数线性膨胀）`,
+);
+check(
+  less.includes("开工先查"),
+  "mapless: 纪律块必须仍在（compose 尾部 `if (body && discipline)` 会因 body 空而静默吞掉它 → 记忆系统失效）",
+);
+// 断言查的是**指令句式**（"先扫上面的X"），不是字面 —— 否则一句合法的否定式
+// （「本档没有常驻目录」）会把自己撞红。2026-10-27 第一版就踩了这个。
+check(!less.includes("先扫上面"), "mapless: 纪律块不把模型支去翻「上面的索引」（本档没有）");
+// 真实矛盾复现（2026-10-27 核验时抓到）：项目层若是**单文件且 >12 条**，它走 renderMap
+// 会打出「地图模式」，而全局指针块当时写的是全称否定「记忆没有常驻索引」——
+// 同一份注入里两句直接打脸，模型会以为有两套检索方式（同 2026-09-29 那个坑）。
+// 夹具的 SLUG 是目录形态（走 renderProjectDir，不产「地图模式」字样），所以躲过了这条 ——
+// 必须单独造一个大层来打。
+const BIG_CWD = "/Users/probe/code/big";
+const BIG_SLUG = "--Users-probe-code-big--";
+mkdirSync(join(HOME, ".dsh/memory/projects"), { recursive: true });
+writeFileSync(join(HOME, ".dsh/memory/projects", `${BIG_SLUG}.md`), probeShard("探针大层项目片", 20));
+const lessBig = at(BIG_CWD);
+check(lessBig.includes("地图模式"), "mapless: 大项目层（>12 条）仍自带「地图模式」段（本档只砍全局层）");
+check(
+  lessBig.includes("全局记忆") && !/记忆\*\*没有\*\*常驻索引|本档没有任何常驻目录/.test(lessBig),
+  "mapless: 指针块与纪律块的否定必须限定到全局层，不能全称 —— 否则与同份注入里项目层的「地图模式」矛盾",
+);
+rmSync(join(HOME, ".dsh/memory/projects", `${BIG_SLUG}.md`));
+
+store.globalEnabled = false;
+check(!at(CWD).includes("往 ~/.dsh/memory/topics/ 的某一片追加"), "mapless: 全局层关闭时不给 topics 写入提示");
+store.globalEnabled = true;
+
+// 桥：条目级搜不到、片级线索能到 —— 这是 mapless 敢去掉常驻地图的唯一依据
+writeFileSync(
+  join(TOPICS, "v094-bridge-only.md"),
+  "<!-- 远程调试桥 · 关键词：外网回连、内网穿透 -->\n\n# 远程调试桥\n- [2026-06-01] remote tunnel bridge fact\n",
+);
+const bOnly = host.searchMemory("外网回连", { limit: 8 });
+check(bOnly.results.length === 0, `mapless: 夹具正文不含查询词 → 条目级零命中（实际 ${bOnly.results.length} 条）`);
+check(
+  bOnly.bridge.some((b) => b.path.endsWith("v094-bridge-only.md")),
+  "mapless: 桥按「片名+关键词」捞回该片（条目漏、桥到 = 本机实测 11/12 vs 7/12 的机制）",
+);
+check(
+  bOnly.bridge.every((b) => b.score > 0),
+  `mapless: 桥只收至少沾到一个 query 词的片（实际分数 ${bOnly.bridge.map((b) => b.score).join(",")}）`,
+);
+check(bOnly.bridge.every((b) => b.keywords.length <= 57), "mapless: 桥关键词按 BRIDGE_KEYWORDS_MAX 截断");
+// 治理信号不能随地图一起消失：mapless 档下 ⚠️超建议 只存在于桥里
+const bigRows = Array.from({ length: 900 }, (_, i) => `- [2026-07-07] 超限探针条目 ${i} 桥接关键词外网回连`).join("\n");
+writeFileSync(join(TOPICS, "v094-bridge-over.md"), `<!-- 超限桥片 · 关键词：外网回连 -->\n\n# 超限桥片\n${bigRows}\n`);
+const bOver = host.searchMemory("外网回连", { limit: 8 });
+const overB = bOver.bridge.find((b) => b.path.endsWith("v094-bridge-over.md"));
+check(overB && overB.over === true && overB.size > 12000, `mapless: 桥带体量/超限标记（实际 size=${overB && overB.size}）`);
+check(
+  host.formatSearchResults(bOver).includes("超建议"),
+  "mapless: 渲染里保留「⚠️超建议」治理提示（地图不注入后这是唯一出口）",
+);
+rmSync(join(TOPICS, "v094-bridge-over.md"));
+// 键集必须与主返回一致：formatSearchResults 会读 bridge，少一个键就是 undefined 分支
+const bStop = host.searchMemory("的 是 了 在 和", { limit: 5 });
+check(Array.isArray(bStop.bridge) && bStop.bridge.length === 0, "mapless: 全虚词早退分支也带 bridge 键（返回对象键集一致）");
+check(host.formatSearchResults(bStop).includes("无命中"), "mapless: 桥为空时退回原「无命中」文案，不渲染空段落");
+const bFewText = host.formatSearchResults(bOnly);
+check(
+  bFewText.includes("相关记忆片") && bFewText.includes("v094-bridge-only.md"),
+  "mapless: 条目零命中那一轮仍渲染桥（那正是唯一能给线索的时候）",
+);
+check(/只沾到 \d+ 片/.test(bFewText), "mapless: 桥不满 top8 时明示「换词再搜」，不让模型误读成记忆全集");
+rmSync(join(TOPICS, "v094-bridge-only.md"));
+store.injectMode = "map";
+check(host.searchMemory("探针分片", { limit: 5 }).bridge.length > 0, "mapless: map 档同样返回桥（两档共用一条检索路径，不分叉）");
 store.injectMode = "index";
 
 // clamp 只作用于「单文件回落」形态：先移走分片，让它回落到 memory.md
@@ -912,6 +1015,28 @@ store.writeHookCommand = "";
   const pvHit = pvProbe.results.find((r) => r.path.endsWith("p1-preview.md"));
   check(pvHit && pvHit.text.includes("zzdeepanchor"), "v0.9.2: 预览窗口定位到命中锚点（旧版从头截会丢掉第 480 字符后的命中词）");
   check(pvHit && pvHit.text.startsWith("…"), `v0.9.2: 窗口不在条目开头时带省略号（实际起头 ${JSON.stringify(pvHit?.text.slice(0, 3))}）`);
+
+  // ── v0.9.3：虚词不参与检索 / 超短 query 拒绝 ─────────────────────────────────
+  // ① 单字符 query：切不出 token，旧实现退化成整库子串命中（实测 "a" 1459/1459 条）。
+  check(host.searchMemory("a").ok === false, "v0.9.3: 单字符 query 被拒绝（不再退化成整库命中）");
+  check(host.searchMemory(" x ").ok === false, "v0.9.3: 单字符（带空白）同样拒绝");
+  // ② 全虚词 query：没有可检索内容 → 空手，而不是命中整库。
+  const stopOnly = host.searchMemory("的 是 了 在 和", { limit: 20 });
+  check(
+    stopOnly.ok === true && stopOnly.results.length === 0 && stopOnly.dropped?.emptyReason === "no-content-tokens",
+    `v0.9.3: 全虚词 query 返回空手并给出 emptyReason（实际 ${stopOnly.results.length} 条 / ${stopOnly.dropped?.emptyReason}）`,
+  );
+  // ③ 虚词判定纪律：整字/整词在表里才算虚词；兼作实义的词（通过/存在）不算。
+  check(host.isStopSearchToken("的") && host.isStopSearchToken("和") && host.isStopSearchToken("the"), "v0.9.3: 虚词判定命中单字虚词与拉丁停用词");
+  check(!host.isStopSearchToken("存在") && !host.isStopSearchToken("通过"), "v0.9.3: 兼作实义的词不被判为虚词（存在/通过）");
+  check(!host.isStopSearchToken("磁盘") && !host.isStopSearchToken("插件"), "v0.9.3: 实义词不被判为虚词");
+  // ④ 虚词混在正常 query 里不影响召回：剔掉虚词后仍能命中。
+  writeFileSync(join(TOPICS, "p2-stop.md"), "# stop probe\n- [2026-07-01] zzstopprobe 的 是 了 真实内容\n");
+  const mixedStop = host.searchMemory("zzstopprobe 的 是 了", { limit: 20 });
+  check(
+    mixedStop.results.some((r) => r.path.endsWith("p2-stop.md")),
+    `v0.9.3: 虚词混在 query 里不影响真实词的召回（results=${mixedStop.results.length}）`,
+  );
 
   // 回合记忆活动投影：read/grep 命中记账、deny 不计、非记忆路径不记、增量与 reset
   const TOPIC = `${HOME}/.dsh/memory/topics/probe-shard.md`;

@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -226,6 +227,57 @@ const SHARD_BONUS_KEYWORD = 2;
 /** 检索结果里**单个分片**最多占几条（防一片霸屏：实测旧版 8/8 全来自同一片）。 */
 const PER_SHARD_MAX = 2;
 
+/**
+ * `memory_search` 返回里附带的**片级桥**条数（v0.9.4 `mapless` 档的核心）。
+ *
+ * 为什么是桥（本机 12 组真实任务实测，脚本 /tmp/bridge-eval.mjs）：条目级检索只有
+ * **7/12** 命中，用同一批 query token 去搜「片名 + 首行关键词」是 **11/12**。条目漏掉的
+ * 4 组（remote-access / image-channel / effort-slider / memory-search-retrieval）桥全部
+ * 在 **#1** 捞回；桥唯一漏的 plugin-patch-drift 是那片**根本没写**「没生效/没重启」这层
+ * 意思 —— 属于记忆本身缺词，任何检索层都救不了。
+ * 机制差别：条目级要求**正文**字面命中，片级只要求**主题**命中。任务措辞是中文口语、
+ * 片名与关键词是英文专名，只有片级线索跨得过这道词汇鸿沟。
+ *
+ * 消融（/tmp/bridge-ablate.mjs）：只片名 3/12、只关键词行 10/12、两者 11/12
+ * → 召回主要来自**关键词行**，所以桥必须带关键词，光给片名没用。
+ */
+const BRIDGE_TOP = 8;
+
+/** 桥里每片关键词的显示截断长度（比 `shardKeywords` 的 96 短：桥只用来认主题）。 */
+const BRIDGE_KEYWORDS_MAX = 56;
+
+/**
+ * 「命中面过宽」的提示阈值（只是**建议收窄**，不做任何过滤）。
+ *
+ * 标定依据（本机同一批 10 组真实任务，条目级 vs 桥）：totalHits 分布
+ * 1, 1, 2, 3, 10, 11, 26, 34, 100, 121 —— >50 的只有 100 / 121 两例，而这**两例条目其实都命中了**
+ * （「内置盘满了 怎么清理」/「改插件后没生效是不是没重启」）。所以这个数**绝不能**用来判定
+ * 「你搜错了」，只配当「词偏泛，可以用更专的名词」的提醒；取 50 是落在实测分布的稀疏带上。
+ * 反过来条目漏的那些组 totalHits 反而很小（1 / 3 / 11 / 26）—— 再次说明命中数与对错无关。
+ */
+const BROAD_HIT_HINT = 50;
+
+/**
+ * `mapless` 档注入系统提示词的**固定指针块**（v0.9.4）。
+ *
+ * 整段**不含片名 / 条数 / 日期**，所以长度恒定、不随记忆增长，也不会因为写了条记忆就让
+ * KV 前缀缓存失效（对比 map 档：本机 188 片 ≈ 39307 字符 / 约 15k token，且每加一片重算）。
+ * 片级线索改由 `memory_search` 的桥按 query 现算 —— 只在真检索的那一轮付费。
+ *
+ * 「模型到底会不会主动搜」有实测依据（脚本 /tmp/when.mjs，扫 842 个会话）：有搜索行为的
+ * 会话里 **91% 在 turn 1 就搜**，首次搜索轮次 p10/p50/p90 全 = 2 → 驱动它的是【开工先查】
+ * 这条纪律，不是地图内容本身（另有 42% 会话从未搜索 = 「琐碎任务不查」的正常豁免面）。
+ */
+const MAPLESS_POINTER = [
+  "<!-- 全局记忆（本机 · 按需检索；正文与目录都不在提示词里）",
+  "     根目录：~/.dsh/memory/topics/。本档砍掉的**只是这一层的常驻地图**（片数一多就是几万字符、每轮都付）。",
+  "     片级线索改由 memory_search 每次按 query 现算 —— 看它返回里的「相关记忆片」段，那就是路由地图。",
+  "     三步：① memory_search query=\"<任务关键词>\" → ② 读「片名 + 关键词」判断该读哪片",
+  "           → ③ read path=<命中片路径> offset=<行号> limit=<条数> 取原文。",
+  "     搜不到不等于没有：换词再搜（中文口语 ↔ 英文专名最容易搜偏），仍无命中才用 grep 扫 ~/.dsh/memory/topics。",
+  "     注：**项目记忆不在本档范围内**，它仍按自己那段的形状注入（体量小，砍它不划算）。 -->",
+].join("\n");
+
 /** 检索预览的字符数与窗口锚点两侧的余量。 */
 const SEARCH_PREVIEW_CHARS = 240;
 const SEARCH_PREVIEW_PAD = 80;
@@ -237,6 +289,50 @@ const SEARCH_PREVIEW_PAD = 80;
  * 分母下限是 `1 − b`（b=0.5 时为 0.5，对 len≥0 恒成立，clamp 只是给调大 b 的人兜底）。
  */
 const SEARCH_LENGTH_B = 0.5;
+
+/**
+ * v0.9.3：虚词表与最短 query 长度。
+ *
+ * 只治一类假阳性 —— **query 里的虚词被当成检索词**。线上库实测（0.9.2）：
+ * `"的 是 了 在 和"` 命中 1270/1458 条、`"a"` 1459 条、`"zzzqqqxxx 不存在的词"`
+ * 81 条（靠「不存/存在/在的/的词」这些常见 bigram 过门槛）。真词查询本来就好
+ * （15 组正向 14/15 命中），所以**不动门槛公式、不动打分**，只让虚词不参与检索。
+ *
+ * 判定纪律：宁可漏判不可误杀。中文 token 要求**每个字**都在表里才算虚词
+ * （「存在」含「在」但「存」不在表 → 不算虚词），单字 token 整字在表里即算。
+ */
+const SEARCH_MIN_QUERY_CHARS = 2;
+
+/** 中文虚词单字表。 */
+const SEARCH_STOP_HAN = new Set(
+  (
+    // 纯语法虚词（去掉它们不损失检索意图）。刻意**不**收「通过 / 存在 / 上下 / 前后」这类
+    // 兼作实义的词 —— 实测把它们当虚词会让 q="advisor 第二模型复核 通过" 的命中从 15 涨到 57。
+    "的地得是在和与或及就都也还把被让给从对为之而则等这那么呢吗啊呀吧于其所但却又更太些谁什怎" +
+    "了着过们么嘛哦嗯哈呗啦咯哇唉个"
+  ).split(""),
+);
+
+/** 拉丁停用词（小写）。 */
+const SEARCH_STOP_LATIN = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "were", "have", "has", "had", "will",
+  "would", "could", "should", "about", "into", "over", "under", "than", "then", "them", "they",
+  "their", "its", "our", "your", "you", "all", "any", "can", "may", "are", "was", "not", "but",
+  "also", "more", "most", "other", "such", "once", "none", "when", "while", "which", "who", "whom",
+  "whose", "these", "those", "in", "on", "of", "to", "at", "by", "as", "is", "it", "be", "do",
+]);
+
+/**
+ * 是否为虚词级 token（不参与检索：不进 df、不进门槛、不计分）。
+ * @param {string} token - 归一化后的小写 token。
+ * @returns {boolean} true = 虚词级。
+ */
+function isStopSearchToken(token) {
+  const chars = [...String(token ?? "")];
+  if (chars.length === 1) return SEARCH_STOP_HAN.has(chars[0]);
+  if (chars.length === 2 && chars.every((c) => SEARCH_STOP_HAN.has(c))) return true;
+  return SEARCH_STOP_LATIN.has(String(token ?? ""));
+}
 
 /**
  * 检索预览：定位到**最稀有**的命中 token 附近取一段窗口，而不是一律从条目开头截 ——
@@ -341,10 +437,14 @@ export {
   slugOf,
   normalizePathText,
   normalizeToolPath,
+  normalizeInjectMode,
+  MAPLESS_POINTER,
   lexicalSearchTokens,
   lexicalRequiredMatchCount,
+  isStopSearchToken,
   entryRows,
   searchMemory,
+  scoreShards,
   formatSearchResults,
   toolMemoryHit,
   projectMemoryActivity,
@@ -386,6 +486,19 @@ export {
 const SETTINGS_PATH = `${HOME}/.dsh/memory/settings.json`;
 
 /**
+ * 注入档位名的归一（v0.9.4 抽成单函数：原来同样的三元链散在 host 1 处 + client 2 处，
+ * 加新档时改漏一处就会出现「面板显示旧档、host 按新档跑」的静默漂移）。
+ * 非法值一律回落 `map`（默认档，行为与历史一致）。
+ *
+ * @param {unknown} raw - 磁盘上或面板提交的候选值。
+ * @returns {"map"|"mapless"|"index"|"full"} 合法档位名。
+ */
+function normalizeInjectMode(raw) {
+  const s = typeof raw === "string" ? raw : "";
+  return s === "full" || s === "index" || s === "mapless" ? s : "map";
+}
+
+/**
  * 归一化：任何形状的输入都折叠成合法设置（面板与钩子读到的都是这个形状）。
  * @param {unknown} value - 磁盘上或面板提交的候选值。
  * @returns {object} 规范化后的设置值。
@@ -401,9 +514,11 @@ function normalizeSettings(value) {
     // 写卡片记忆路径同样被拦（此时召唤会话完全没有可写层）。
     cardsEnabled: v.cardsEnabled !== false,
     maxChars: budget,
-    // 默认 map（片级地图）：条目标题不常驻，改由 memory_search 按需取；
-    // index = 地图 + 逐条标题（受 indexBudget 收缩）；full = 正文整篇注入
-    injectMode: v.injectMode === "full" ? "full" : v.injectMode === "index" ? "index" : "map",
+    // map（默认）= 片级地图常驻；mapless = 地图不常驻，片级线索改由 memory_search 现算桥；
+    // index = 地图 + 逐条标题（受 indexBudget 收缩）；full = 正文整篇注入。
+    // 档位三元链在本包共**三处**（此处 + client.js 两处面板侧），加新档必须同步改，
+    // 只改 host 会出现「面板显示 map、host 按新档跑」的漂移（2026-10-27 记）。
+    injectMode: normalizeInjectMode(v.injectMode),
     // 索引模式自己的预算：与 maxChars（正文上限）解耦，面板上两个档位各自独立
     indexBudget: Number.isFinite(v.indexBudget) ? Math.max(0, Math.floor(v.indexBudget)) : DEFAULT_INDEX_BUDGET,
     // ── 钩子子系统 ──
@@ -466,7 +581,16 @@ function knownProjects() {
  * @returns {string} slug。
  */
 function slugOf(cwd) {
-  const normalized = normalizePathText(String(cwd ?? ""));
+  // 工作区迁移后旧路径可能只是指向新位置的符号链接：会话 header.cwd 仍是旧串，
+  // 新会话拿到的是外置盘 realpath。先取 realpath，两类会话才落在同一层记忆上，
+  // 与 DSH 核心用 realpath 判定 workspace 唯一性的口径一致。解析失败退回原样。
+  let canonical = String(cwd ?? "");
+  try {
+    canonical = realpathSync(canonical);
+  } catch {
+    /* 目录不存在（历史会话）时保持旧行为 */
+  }
+  const normalized = normalizePathText(canonical);
   const withoutDrive = normalized.replace(/^([A-Za-z]):(?=\/|$)/, "$1");
   const slug = withoutDrive.replace(/^\/+/, "").replace(/[/:]+/g, "-");
   return `--${slug.length > 0 ? slug : "root"}--`;
@@ -795,6 +919,60 @@ function layerEntryTotal(files) {
 }
 
 // ── memory_search：词法检索器（v0.8，借鉴 dsh-mnemon 的 lexical 检索层）────────
+
+/**
+ * 片级**桥**打分（v0.9.4，`mapless` 档的路由地图生成器）。
+ *
+ * 与条目级检索同形但语料不同：这里 df 统计的是「该词出现在多少片的**片名+关键词行**里」，
+ * 所以命中门槛是**主题级**的字面重合，不要求正文出现该词。正是这一点让它跨得过
+ * 中文口语 ↔ 英文专名的鸿沟（实测 11/12 vs 条目级 7/12，见 BRIDGE_TOP）。
+ *
+ * 单独成函数的理由：要能脱离 `searchMemory` 的读盘过程直接喂 shardViews 单测。
+ *
+ * @param {string[]} tokens - 已去虚词的 query token（与条目级用同一批，保证口径一致）。
+ * @param {string} normalized - NFKC + 小写的整句 query，用于整句命中加分。
+ * @param {{path:string,name:string,keywords:string,hay:string,latest?:string,size?:number}[]} shardViews - pass1 收集的片级视图。
+ * @param {number} [top] - 取前几条。
+ * @returns {{path:string,name:string,keywords:string,score:number,hits:string[],latest:string,size:number,over:boolean}[]} 按分降序的片线索（分数 ≤0 的纯噪声片已剔除）。
+ */
+function scoreShards(tokens, normalized, shardViews, top = BRIDGE_TOP) {
+  if (!Array.isArray(tokens) || tokens.length === 0 || !Array.isArray(shardViews) || shardViews.length === 0) {
+    return [];
+  }
+  const n = shardViews.length;
+  // 片级 df：与条目级一样，df=0 的碎片（跨词切出来的 bigram）权重记 0 并跳过，
+  // 否则一个不存在的碎片就能把整层片都点亮。
+  const df = new Array(tokens.length).fill(0);
+  for (const s of shardViews) {
+    for (let i = 0; i < tokens.length; i += 1) if (s.hay.includes(tokens[i])) df[i] += 1;
+  }
+  const scored = [];
+  for (const s of shardViews) {
+    let score = 0;
+    const hits = [];
+    if (s.hay.includes(normalized)) score += SHARD_BONUS_PHRASE * 2; // 整句命中：最强信号
+    for (let i = 0; i < tokens.length; i += 1) {
+      if (df[i] === 0 || !s.hay.includes(tokens[i])) continue;
+      score += Math.log(1 + n / df[i]);
+      hits.push(tokens[i]);
+    }
+    if (score <= 0) continue; // 一个词都没沾 = 噪声，不进桥
+    scored.push({
+      path: s.path,
+      name: s.name,
+      keywords: s.keywords.length > BRIDGE_KEYWORDS_MAX ? `${s.keywords.slice(0, BRIDGE_KEYWORDS_MAX)}…` : s.keywords,
+      latest: s.latest ?? "",
+      size: typeof s.size === "number" ? s.size : 0,
+      over: typeof s.size === "number" && s.size > SHARD_WARN_CHARS,
+      score: +score.toFixed(2),
+      hits,
+    });
+  }
+  // tie-break 用片名而不是日期：桥的用途是「认主题」，同分时按字面稳定排序更可复现
+  scored.sort((a, b) => b.score - a.score || String(a.name).localeCompare(String(b.name)));
+  return scored.slice(0, top);
+}
+
 // 与裸 grep 的差别：NFKC 归一化、中文 bigram 切分（"插件开发"→插件/件开/开发）、
 // 字段加权（片名>关键词>条目）、token 覆盖度门槛（query 足够聚焦后才要求更广覆盖）、
 // 相关度排序。纯同步文件扫描，百片量级毫秒级，无索引、无依赖。
@@ -897,9 +1075,17 @@ function entryRows(text) {
 function searchMemory(query, options = {}) {
   const raw = String(query ?? "").trim();
   if (raw === "") return { ok: false, error: "query is required" };
+  // 单字符 query 切不出 token，旧实现退化成整库子串命中（实测 "a" 返回 1459/1459 条）。
+  if (raw.replace(/\s+/g, "").length < SEARCH_MIN_QUERY_CHARS) {
+    return { ok: false, error: `query too short: need at least ${SEARCH_MIN_QUERY_CHARS} characters` };
+  }
   const limit = Math.max(1, Math.min(20, Math.trunc(options.limit ?? 8)));
   const normalized = raw.normalize("NFKC").toLocaleLowerCase();
-  const tokens = lexicalSearchTokens(normalized);
+  // 虚词在入口就剔掉：它们不参与 df、不参与门槛、不计分。
+  const tokens = lexicalSearchTokens(normalized).filter((t) => !isStopSearchToken(t));
+  // 全是虚词（"的 是 了 在 和"）：没有可检索内容，直接空手。
+  // 不能落到下面的「tokens 为空 → exact 兜底」分支，那会把整库都放进来。
+  const allStop = tokens.length === 0;
   // required 到 pass2 才算：要先有 df 才能剔出跨词碎片（见下方 validTokens）。
 
   const cwd = typeof options.cwd === "string" ? options.cwd.trim() : "";
@@ -947,12 +1133,29 @@ function searchMemory(query, options = {}) {
   const df = new Array(tokens.length).fill(0);
   let totalLen = 0;
   let scannedEntries = 0;
+  // 片级视图（v0.9.4 桥）：pass1 已经读了正文、也算好了 name / keywords，这里顺手收下来，
+  // **不额外读盘**。桥是 mapless 档下唯一的路由地图（常驻地图不注入了），所以它必须
+  // 覆盖**池内全部片**（含项目层），不能只列全局 topics。
+  const shardViews = [];
   for (const f of files) {
     const text = readOrEmpty(f.path);
     if (!text.trim()) continue;
     const name = shardName(text, f.name);
     const nName = name.normalize("NFKC").toLocaleLowerCase();
-    const nKeywords = shardKeywords(text, name).normalize("NFKC").toLocaleLowerCase();
+    const kwRaw = shardKeywords(text, name);
+    const nKeywords = kwRaw.normalize("NFKC").toLocaleLowerCase();
+    shardViews.push({
+      path: f.path,
+      layer: f.layer,
+      name,
+      keywords: kwRaw,
+      hay: `${nName} ${nKeywords}`,
+      // 体量：`mapless` 档下地图不注入，「该片已超建议上限」这个治理信号原本就随地图消失了
+      // （写进地图是 shardHeadLine 的 ⚠️）。桥补上它，模型检索时仍能顺手看见「这片该拆了」。
+      size: text.length,
+      latest: "", // 下面的条目循环里顺带求最大值（比再扫一遍 latestEntryDate 便宜）
+    });
+    const view = shardViews[shardViews.length - 1];
     // 片级线索：**循环外**算一次，只用于同分 tie-break，不进条目分、不进覆盖判定。
     const shardBonus = nName.includes(normalized)
       ? SHARD_BONUS_PHRASE
@@ -966,12 +1169,14 @@ function searchMemory(query, options = {}) {
       for (let i = 0; i < tokens.length; i++) if (nEntry.includes(tokens[i])) hitIdx.push(i);
       for (const i of hitIdx) df[i] += 1;
       totalLen += nEntry.length;
+      const edate = (entry.text.match(/\[(\d{4}-\d{2}-\d{2})\]/) ?? [])[1] ?? "";
+      if (edate > view.latest) view.latest = edate;
       rows.push({
         path: f.path,
         shard: name,
         layer: f.layer,
         line: entry.line,
-        date: (entry.text.match(/\[(\d{4}-\d{2}-\d{2})\]/) ?? [])[1] ?? "",
+        date: edate,
         norm: nEntry,
         flat: entry.text.replace(/\s+/g, " "),
         hitIdx,
@@ -985,6 +1190,19 @@ function searchMemory(query, options = {}) {
   // df=0 的 token 是中文 bigram 的跨词碎片（「盘空」「索历」，语料里不存在），权重记 0
   // 并**剔出覆盖门槛的分母** —— 旧实现把它们计入 token 数，门槛虚高。
   const poolSize = rows.length;
+  if (allStop) {
+    return {
+      ok: true,
+      query: raw,
+      results: [],
+      // 键集必须与主返回完全一致（formatSearchResults 会读 bridge；少一个键就是 undefined 分支）。
+      // 全虚词 = 没有任何可检索的词，桥也无从算起 → 空数组。
+      bridge: [],
+      scanned: { files: files.length, entries: scannedEntries, scope: scoped ? "current" : "all" },
+      totalHits: 0,
+      dropped: { capped: 0, backfilled: 0, offScopeLayers, offScopeFiles, emptyReason: "no-content-tokens" },
+    };
+  }
   const weight = tokens.map((t, i) => (df[i] > 0 ? Math.log(1 + poolSize / df[i]) : 0));
   const validTokens = [];
   for (let i = 0; i < tokens.length; i++) if (weight[i] > 0) validTokens.push(tokens[i]);
@@ -1059,14 +1277,53 @@ function searchMemory(query, options = {}) {
     }
   }
   picked.sort(compare);
+  // 桥用**同一批 tokens**（含 df=0 的，scoreShards 内部自己剔），保证与条目级口径一致。
+  // 每次都算：实测「桥里有没有条目结果没覆盖的片」在 12/12 组 case 上恒为真
+  // （片级命中与条目级命中本来就来自不同语料），所以没有可靠的「只在搜偏时才给」判据 ——
+  // 与其赌一个未验证的触发阈值，不如固定给出，代价只是 top8 行文本。
   return {
     ok: true,
     query: raw,
     results: picked,
+    bridge: scoreShards(tokens, normalized, shardViews),
     scanned: { files: files.length, entries: scannedEntries, scope: scoped ? "current" : "all" },
     totalHits: results.length,
     dropped: { capped, backfilled, offScopeLayers, offScopeFiles },
   };
+}
+
+/**
+ * 渲染**片级桥**段（v0.9.4）。`mapless` 档下常驻地图不注入了，这一段就是模型唯一的路由地图，
+ * 所以措辞必须自己把「读完再决定 read 哪片」这条动作链说全。
+ *
+ * @param {object} value - searchMemory 的返回值。
+ * @param {Set<string>} coveredPaths - 条目结果已覆盖的片路径（标 `*`，避免模型重复 read 同一片）。
+ * @returns {string[]} 渲染行（桥为空时返回空数组）。
+ */
+function renderBridgeLines(value, coveredPaths) {
+  const bridge = Array.isArray(value.bridge) ? value.bridge : [];
+  if (bridge.length === 0) return [];
+  // 桥只收「至少沾到一个 query 词」的片（scoreShards 里 score<=0 不进），所以沾词片少时会
+  // 明显少于 BRIDGE_TOP。必须把这件事写出来 —— 否则模型看到 1 条会以为「记忆里只有这一片沾边」，
+  // 而不是「我的词只沾到 1 片，换个词可能出来一批」。
+  const narrow =
+    bridge.length < BRIDGE_TOP
+      ? `（本次 query 只沾到 ${bridge.length} 片，共扫 ${value.scanned.files} 片 —— 沾不到不代表没有，换词再搜）`
+      : `（top${bridge.length} / 共扫 ${value.scanned.files} 片）`;
+  const out = ["", `── 相关记忆片 ${narrow} ──`];
+  bridge.forEach((b, i) => {
+    const mark = coveredPaths.has(b.path) ? "*" : " ";
+    const words = b.hits && b.hits.length ? ` · 沾词 ${b.hits.slice(0, 4).join("/")}` : "";
+    const fresh = b.latest ? ` · 最新 ${b.latest}` : "";
+    // 治理信号：mapless 档没有常驻地图，`⚠️超建议` 只能在这里给（对照 map 档的 shardHeadLine）
+    const warn = b.over ? ` ⚠️超建议${SHARD_WARN_CHARS}，读完顺手按子主题拆片` : "";
+    out.push(`${i + 1}.${mark} [${b.score}] ${b.name}${fresh}${words} → ${b.path}${warn}`);
+    if (b.keywords) out.push(`       关键词：${b.keywords}`);
+  });
+  out.push("（`*` = 上面条目结果已出自该片，不必重复 read 同一片）");
+  out.push("→ 先看关键词判断该读哪片，再 read path=<上面路径> offset=<条目行号>；片名与关键词只说明主题，不保证内容。");
+  out.push("→ 若这些片都不是你要的：说明 query 与记忆之间存在词汇鸿沟，换更专的词（英文插件名 / 文件名 / 报错码 / 设置键名）重搜一次。");
+  return out;
 }
 
 /** 把检索结果渲染成模型可读文本（工具 output.render 用）。 */
@@ -1081,16 +1338,32 @@ function formatSearchResults(value) {
     value.dropped?.capped > 0
       ? `；每片限 ${PER_SHARD_MAX} 条，挡 ${value.dropped.capped} 条（其中 ${value.dropped.backfilled ?? 0} 条因名额没铺满已回填）`
       : "";
+  const covered = new Set((value.results || []).map((r) => r.path));
+  // 泛化提示：totalHits 是**通过门槛的条目总数**，本机 12 组实测 >50 的三例里 2 命中 1 漏，
+  // 所以它只配当「可以收窄」的建议，不能当「你搜错了」的判定。
+  const broadNote =
+    value.totalHits > BROAD_HIT_HINT ? `；命中面较宽（${value.totalHits} 条）说明词偏泛，可用更专的名词收窄` : "";
   if (value.results.length === 0) {
+    // 条目零命中时**桥尤其要给**：条目级要求正文字面命中、片级只要求主题命中，
+    // 实测 4 组条目全漏的任务措辞，桥都在 #1 捞回了正确的片。
+    const bridge = renderBridgeLines(value, covered);
+    if (bridge.length > 0) {
+      return [
+        `memory_search：条目无命中（扫描 ${value.scanned.files} 个文件 / ${value.scanned.entries} 条条目${scopeNote}），但片级线索有候选：`,
+        ...bridge,
+        "→ 仍没有相关片才用 grep 做精确正则；要找别的项目的记忆就带 scope:\"all\"。",
+      ].join("\n");
+    }
     return `memory_search：无命中（扫描 ${value.scanned.files} 个文件 / ${value.scanned.entries} 条条目${scopeNote}）。换关键词重试，或用 grep 做精确正则；要找别的项目的记忆就带 scope:"all"。`;
   }
   const rows = value.results.map(
     (r, i) => `${i + 1}. [score ${r.score}] ${r.path}:${r.line}${r.date ? ` [${r.date}]` : ""}\n   ${r.text}`,
   );
   return [
-    `memory_search：共 ${value.totalHits} 条命中（显示前 ${value.results.length} 条；扫描 ${value.scanned.files} 文件 / ${value.scanned.entries} 条目${scopeNote}${capNote}），按相关度排序。`,
+    `memory_search：共 ${value.totalHits} 条命中（显示前 ${value.results.length} 条；扫描 ${value.scanned.files} 文件 / ${value.scanned.entries} 条目${scopeNote}${capNote}），按相关度排序${broadNote}。`,
     ...rows,
     "→ read 对应文件的行号取上下文；条目行号即记忆纪律里的 L 号。",
+    ...renderBridgeLines(value, covered),
   ].join("\n");
 }
 
@@ -1352,7 +1625,22 @@ function compose(context) {
   // ── 全局层 ──────────────────────────────────────────────────────────────
   const mode = values.injectMode;
   const blocks = [];
-  if (values.globalEnabled !== false) {
+  if (mode === "mapless") {
+    // mapless：片级地图**不常驻**（本机实测 188 片 ≈ 39307 字符 / 约 15k token，每轮都付），
+    // 改由 memory_search 每次按 query 现算「相关记忆片」桥（见 BRIDGE_TOP）。
+    // 这里只注入一段**固定文本**的指针块：长度与记忆规模无关，所以
+    // ① 不随记忆增长而膨胀；② 不会因「新写一条记忆」改动 system prompt 前缀而作废 KV 缓存。
+    // 必须 push 进 blocks（而不是直接 return 一个空 body）—— compose 尾部是
+    // `if (body && values2.discipline !== false)`，body 为空会把【开工先查】纪律一起吞掉，
+    // 记忆系统静默失效且面板看不出异常（2026-10-27 记）。
+    const writeHint =
+      values.globalEnabled === false
+        ? ""
+        : "\n\n<!-- 写入本层：往 ~/.dsh/memory/topics/ 的某一片追加一行（- [YYYY-MM-DD] 事实），或新建主题文件（首行写「片名 · 关键词」路由注释） -->";
+    // 同样过 neutralizePromptVars：MAPLESS_POINTER 现在是常量、不含 `{{`，但它随时可能被
+    // 后续改动写进模板占位符 —— 与地图/索引一样必须拆开，否则整段组装会抛 unknown variable。
+    blocks.push(neutralizePromptVars(`${MAPLESS_POINTER}${writeHint}`));
+  } else if (values.globalEnabled !== false) {
     if (mode === "full") {
       // full 模式：走分片正文（而不是已废弃的 memory.md 导航索引）——见 renderShardFull
       const body = renderShardFull(`全局记忆 · ${HOME}/.dsh/memory`, layerFiles(TOPICS_DIR, GLOBAL_MEMORY));
@@ -1378,14 +1666,19 @@ function compose(context) {
       const dir = `${PROJECT_DIR}/${slug}`;
       const indexPath = `${dir}/MEMORY.md`;
       const filePath = `${PROJECT_DIR}/${slug}.md`;
-      if (mode !== "full") {
+      // 项目层在 mapless 下**照旧注入**（不当作"地图"砍掉）：它只有几条到几十条，
+      // 且目录形态的 MEMORY.md 是人写的摘要 —— 比自动索引值钱，固定成本也就几 k 字符。
+      // 真正吃掉 token 的是全局层那 188 片地图，所以本档只砍全局层。
+      // 归一成 "map" 走同一条渲染路径（小层逐条内联 / 目录形态整篇注入），避免行为分叉。
+      const projMode = mode === "mapless" ? "map" : mode;
+      if (projMode !== "full") {
         // 目录形式：MEMORY.md 已是人写索引，走「索引正文 + 孤儿正文清单」——地图模式同样整篇保留它
         // （人写的摘要是路由信息，比自动索引更值钱，本来也只有几 k 字符）
         // 单文件形式：本身就是条目集合，按当前模式渲染（条目少时地图模式仍逐条内联）
         const dirShape = isDir(dir);
         const body = dirShape
           ? renderProjectDir(cwd, dir)
-          : renderLayer(mode, `项目记忆 · ${cwd}`, layerFiles("", filePath));
+          : renderLayer(projMode, `项目记忆 · ${cwd}`, layerFiles("", filePath));
         if (body) {
           blocks.push(
             neutralizePromptVars(
@@ -2449,6 +2742,10 @@ async function postExecuteHook(exec, result, next) {
  * 否则会退化成「没线索就不读」—— 那个失败模式在 2026-09-28 的索引预算事故里已经见过一次。
  */
 const DISCIPLINE_HEAD = {
+  mapless: [
+    "     · 【开工先查】非琐碎任务开头先调 `memory_search`（拿任务里的关键词：框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）；返回里的「相关记忆片」段就是路由地图（按 query 现算的 top8 片名+关键词），据此判断该读哪片，再 `read path=<片> offset=<行号>` 取原文。命中条目/行号才动手，没命中就不读，别整库通读。**全局记忆这一层没有常驻目录**（项目层若有自己的地图段落，按那一段的指引读它）",
+    "     · 【搜偏了】本机的坑是中文口语 ↔ 英文专名的词汇鸿沟（「外网连回」搜不到 remote-access、「状态条文案」搜不到 effort-slider）：首次搜索若只返回无关条目，先换更专的词（英文插件名 / 文件名 / 报错码 / 设置键名）再搜一次，仍无命中才用 `grep pattern=\"<关键词>\" path=\"~/.dsh/memory\"` 兜底",
+  ],
   map: [
     "     · 【开工先查】非琐碎任务开头先取线索：拿任务里的关键词（框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）先调 `memory_search` 查记忆；命中条目 / 行号再动手，没命中就不读，别整库通读。只有 `memory_search` 无命中、或要精确正则 / 按路径限定范围 / 回读已知文件时，才用 `grep` / `read` 直查记忆目录 —— 全局为 `~/.dsh/memory/topics`，项目层路径见下面各片段。（片段里**已经逐条内联**的层不用再检索：直接按行号 `read` 即可；标着「地图模式」的层才需要先查）",
     "     · 【读法】`memory_search` 命中行自带行号 → `read path=<片路径> offset=<行号> limit=<要几条>`；片名与关键词只说明主题、不保证内容，禁止凭片名臆测",
