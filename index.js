@@ -28,6 +28,7 @@ import { dirname, resolve } from "node:path";
 //   GLOBAL   ~/.dsh/memory.md                                  跨项目（用户偏好 / 环境事实 / 通用坑）
 //   PROJECT  ~/.dsh/memory/projects/<slug>/                    仅该项目
 //              ├── MEMORY.md     ← 注入这一份（它是索引：- [标题](文件.md) — 摘要）
+//              │                   mapless 档例外：只给一行指针，摘要靠 memory_search 现算
 //              └── *.md          ← 主题文件，需要细节时由 agent 直接读
 //            或 <slug>.md        ← 单文件形式（向后兼容）
 // 项目 slug 规则与 DSH 的会话目录一致：cwd 的 '/' → '-'，两端加 '--'。
@@ -275,7 +276,8 @@ const MAPLESS_POINTER = [
   "     三步：① memory_search query=\"<任务关键词>\" → ② 读「片名 + 关键词」判断该读哪片",
   "           → ③ read path=<命中片路径> offset=<行号> limit=<条数> 取原文。",
   "     搜不到不等于没有：换词再搜（中文口语 ↔ 英文专名最容易搜偏），仍无命中才用 grep 扫 ~/.dsh/memory/topics。",
-  "     注：**项目记忆不在本档范围内**，它仍按自己那段的形状注入（体量小，砍它不划算）。 -->",
+  "     注：项目记忆在本档**同样不常驻** —— 目录形态的人写索引（MEMORY.md + 每片摘要）只给一行指针，",
+  "     摘要仍是检索语料；只有单文件形态的小项目层才按地图 / 逐条内联。 -->",
 ].join("\n");
 
 /** 检索预览的字符数与窗口锚点两侧的余量。 */
@@ -430,6 +432,20 @@ export const inject = ["systemPrompt"];
 
 /** 插件宿主上下文（apply 时赋值）：handleActivity 按 sessionId 取 agent.session 用。 */
 let HOST_CTX = null;
+let WORKING_DIRECTORY = null;
+
+/** 优先读宿主当前目录投影；仅在旧宿主没有该服务时回落会话初始目录。 */
+function readAgentCwd(agent) {
+  try {
+    const scoped = typeof agent?.ctx?.get === "function";
+    const service = scoped ? agent.ctx.get("workingDirectory") : WORKING_DIRECTORY;
+    if (scoped && !service && WORKING_DIRECTORY) return ""; // 不穿透当前 Agent 的服务隔离。
+    if (service?.get && agent?.session) return firstText(service.get(agent.session));
+  } catch {
+    return ""; // 已有服务故障时不猜旧项目；自动召回会跳过，而非扩大到全库。
+  }
+  return firstText(agent?.session?.header?.cwd);
+}
 
 // 钩子子系统的纯函数与处理器：导出仅供 tests/probe.mjs 直测（host 半边自包含，无副作用）。
 export {
@@ -444,6 +460,13 @@ export {
   isStopSearchToken,
   entryRows,
   searchMemory,
+  searchMemoryLegacy,
+  searchIdentifiers,
+  hasIdentifier,
+  enhancedQuery,
+  entryEvidence,
+  readAgentCwd,
+  autoRecallHook,
   scoreShards,
   formatSearchResults,
   toolMemoryHit,
@@ -514,7 +537,8 @@ function normalizeSettings(value) {
     // 写卡片记忆路径同样被拦（此时召唤会话完全没有可写层）。
     cardsEnabled: v.cardsEnabled !== false,
     maxChars: budget,
-    // map（默认）= 片级地图常驻；mapless = 地图不常驻，片级线索改由 memory_search 现算桥；
+    // map（默认）= 片级地图常驻；mapless = 常驻地图/索引都不注入（全局片级地图 +
+    // 目录形态项目层的 MEMORY.md 摘要），线索改由 memory_search 现算桥；
     // index = 地图 + 逐条标题（受 indexBudget 收缩）；full = 正文整篇注入。
     // 档位三元链在本包共**三处**（此处 + client.js 两处面板侧），加新档必须同步改，
     // 只改 host 会出现「面板显示 map、host 按新档跑」的漂移（2026-10-27 记）。
@@ -531,6 +555,9 @@ function normalizeSettings(value) {
     audit: v.audit !== false,
     // 回合记忆栏（client 半边的 conversation.chat.turnTail 插槽），关掉只是不显示
     turnTail: v.turnTail !== false,
+    // 手改 settings.json 即可独立回退；面板提交其它字段不会丢掉这些设置。
+    searchMode: v.searchMode === "legacy" ? "legacy" : "enhanced",
+    autoRecall: v.autoRecall !== false,
   };
 }
 
@@ -1072,7 +1099,7 @@ function entryRows(text) {
  *   scope `"current"`（默认）| `"all"`；cwd 缺失时自动退化为 `"all"`。
  * @returns {{ok:true,query:string,results:object[],scanned:{files:number,entries:number,scope:string},totalHits:number,dropped:{capped:number,backfilled:number,offScopeLayers:number,offScopeFiles:number}}|{ok:false,error:string}}
  */
-function searchMemory(query, options = {}) {
+function searchMemoryLegacy(query, options = {}, inspect) {
   const raw = String(query ?? "").trim();
   if (raw === "") return { ok: false, error: "query is required" };
   // 单字符 query 切不出 token，旧实现退化成整库子串命中（实测 "a" 返回 1459/1459 条）。
@@ -1126,6 +1153,13 @@ function searchMemory(query, options = {}) {
     }
   }
 
+  if (options.enabledOnly) {
+    const settings = readSettings();
+    for (let i = files.length - 1; i >= 0; i -= 1) {
+      const layer = files[i].layer;
+      if (layer === "global" ? !settings.globalEnabled : settings.projectEnabled?.[layer.slice("project:".length)] === false) files.splice(i, 1);
+    }
+  }
   // ── pass1：收池内全部条目，同时统计每个 token 的 df 与平均条目长度 ──────────
   // df/avgLen 与 pass2 必须用**同一个 scoring pool**（上面 scope 过滤后的 files），
   // 否则 idf 的 N 与实际语料不一致，稀有度不可比。
@@ -1156,13 +1190,22 @@ function searchMemory(query, options = {}) {
       latest: "", // 下面的条目循环里顺带求最大值（比再扫一遍 latestEntryDate 便宜）
     });
     const view = shardViews[shardViews.length - 1];
+    // 同一遍读盘顺带保存条目所在章节；旧排序不使用这些新增字段。
+    const headings = [];
+    let inFence = false;
+    text.split("\n").forEach((line, i) => {
+      if (/^\s*```/.test(line)) inFence = !inFence;
+      if (!inFence && /^#{1,6}\s+/.test(line)) headings.push({ line: i + 1, text: line.replace(/^#+\s+/, "") });
+    });
     // 片级线索：**循环外**算一次，只用于同分 tie-break，不进条目分、不进覆盖判定。
     const shardBonus = nName.includes(normalized)
       ? SHARD_BONUS_PHRASE
       : nKeywords.includes(normalized)
         ? SHARD_BONUS_KEYWORD
         : 0;
+    let headingIndex = -1;
     for (const entry of entryRows(text)) {
+      while (headingIndex + 1 < headings.length && headings[headingIndex + 1].line < entry.line) headingIndex += 1;
       scannedEntries += 1;
       const nEntry = entry.text.normalize("NFKC").toLocaleLowerCase();
       const hitIdx = [];
@@ -1179,11 +1222,20 @@ function searchMemory(query, options = {}) {
         date: edate,
         norm: nEntry,
         flat: entry.text.replace(/\s+/g, " "),
+        original: entry.text,
+        endLine: entry.line + entry.text.split("\n").length - 1,
+        heading: headings[headingIndex]?.text ?? "",
+        context: `${nName} ${f.name} ${nKeywords}`,
         hitIdx,
         exact: nEntry.includes(normalized),
         shardBonus,
       });
     }
+  }
+
+  // 增强检索复用此池：不做第二次文件扫描，也不把正文附加到工具返回值。
+  if (typeof inspect === "function" && inspect({ rows, shardViews, files, scoped, offScopeLayers, offScopeFiles }) === true) {
+    return { ok: true }; // 内部 collect-only 路径；无需再执行旧排序和旧预览。
   }
 
   // ── pass2：IDF 加权打分 + 长度归一 + 锚点预览 ─────────────────────────────
@@ -1292,6 +1344,347 @@ function searchMemory(query, options = {}) {
   };
 }
 
+// ── 增强词法检索：原文仍是唯一事实源，不调用模型、不建第二份记忆库 ───────────
+
+const SEARCH_EVIDENCE_CHARS = 480;
+// 有界的通用术语/口语别名；不是语义模型，也不从一次查询里学习或写回记忆。
+const SEARCH_ALIAS_GROUPS = [
+  ["外网", "公网", "连回", "回连", "远程", "隧道", "内网穿透", "remote", "tunnel"],
+  ["重启", "重载", "重新加载", "没生效", "没效果", "restart", "reload", "hmr"],
+  ["搜索", "检索", "查找", "search", "retrieval"],
+  ["记忆", "memory"],
+  ["思考强度", "推理强度", "思考档位", "reasoning", "effort"],
+  ["状态条", "状态栏", "status", "footer"],
+  ["快捷键", "热键", "shortcut", "hotkey"],
+  ["目录树", "文件树", "工作区文件", "workspace files", "file tree"],
+  ["磁盘空间", "空间不足", "磁盘满", "磁盘", "disk", "storage"],
+  ["版本漂移", "更新覆盖", "旧版本", "drift"],
+];
+
+function searchNorm(value) {
+  return String(value ?? "").normalize("NFKC").toLocaleLowerCase();
+}
+
+/** 原标识符保留，分隔符/驼峰拆词只作补充，不能用通用词替代缺失实体。 */
+function identifierParts(value) {
+  return searchNorm(String(value).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z])([A-Z][a-z])/g, "$1 $2"))
+    .split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
+const SEARCH_HYPHEN_MODIFIERS = new Set([
+  "read-only", "write-only", "real-time", "built-in", "end-to-end", "cross-platform",
+  "long-term", "short-term", "full-text", "well-known", "on-demand", "open-source", "non-blocking",
+]);
+function searchIdentifiers(raw) {
+  const words = String(raw).normalize("NFKC").match(/[A-Za-z][A-Za-z0-9_.-]*/g) ?? [];
+  return [...new Set(words.filter((w) => !SEARCH_HYPHEN_MODIFIERS.has(w.toLowerCase())
+    && /[_-][A-Za-z0-9]|\.[A-Za-z]{1,8}$|[a-z][A-Z]|[A-Za-z]\d|\d[A-Za-z]/.test(w)))];
+}
+
+function identifierHay(text) {
+  return searchNorm(String(text).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z])([A-Z][a-z])/g, "$1 $2"))
+    .replace(/(^|[^a-z0-9_.-])--(?=[a-z])/g, "$1");
+}
+
+// 有界缓存仅存匹配器，不存查询结果或记忆正文。
+const searchPatternCache = new Map();
+function identifierPattern(identifier, strict = true) {
+  const key = `${strict ? "entity" : "word"}:${identifier}`;
+  if (searchPatternCache.has(key)) return searchPatternCache.get(key);
+  const parts = identifierParts(identifier);
+  if (!parts.length) return null;
+  const escaped = parts.map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const edge = strict ? "a-z0-9_.-" : "a-z0-9";
+  const pattern = new RegExp(`(?<![${edge}])${escaped.join("[\\s_.:/\\\\-]*")}(?![${edge}])`, "u");
+  if (searchPatternCache.size >= 256) searchPatternCache.delete(searchPatternCache.keys().next().value);
+  searchPatternCache.set(key, pattern);
+  return pattern;
+}
+
+function hasIdentifier(text, identifier) {
+  return identifierPattern(identifier)?.test(identifierHay(text)) ?? false;
+}
+
+function searchTermPresent(hay, term) {
+  if (/^[a-z0-9 _.-]+$/i.test(term)) return identifierPattern(term, false)?.test(identifierHay(hay)) ?? false;
+  return searchNorm(hay).includes(term);
+}
+
+function enhancedQuery(raw) {
+  const identifiers = searchIdentifiers(raw);
+  const core = [...new Set([
+    ...lexicalSearchTokens(raw).filter((t) => !isStopSearchToken(t)),
+    ...identifiers.flatMap(identifierParts).filter((t) => t.length >= 2 && !isStopSearchToken(t)),
+  ])].slice(0, 64);
+  const groups = SEARCH_ALIAS_GROUPS.filter((group) => group.some((t) => searchTermPresent(raw, t)));
+  const expanded = [...new Set(groups.flat())].filter((t) => !core.includes(t)).slice(0, 32);
+  return { core, expanded, identifiers, groups, normalized: searchNorm(raw) };
+}
+
+/**
+ * 只从真实分片名称解析简称，不放宽正文中的精确实体边界。
+ * 多段完整后缀可省命名空间：remote-access 对应 dsh-remote-access；
+ * foo_bar 不能省略 foo_bar_v2 的版本后缀，也不把普通正文中的局部子串登记为别名。
+ */
+function subjectAliases(identifiers, views) {
+  const resolved = [];
+  for (const requested of identifiers) {
+    const wanted = identifierParts(requested);
+    if (wanted.length < 2 || wanted.join("").length < 5) continue;
+    for (const view of views) {
+      const filename = view.path.split("/").pop().replace(/\.md$/i, "");
+      const names = [filename, ...searchIdentifiers(view.name)];
+      for (const canonical of new Set(names)) {
+        const parts = identifierParts(canonical);
+        if (parts.length < wanted.length || !wanted.every((part, i) => part === parts[parts.length - wanted.length + i])) continue;
+        resolved.push({ requested, canonical, path: view.path, kind: parts.length > wanted.length ? "subject-suffix" : "subject-name" });
+        break;
+      }
+    }
+  }
+  return resolved;
+}
+
+// 自动注入比手动检索保守：通用平台/动作词不能单独充当主题证据。
+const RECALL_GENERIC_TOPIC = new Set([
+  "dsh", "插件", "模型", "目录", "项目", "配置", "修改", "问题", "使用", "现在", "这个", "那个",
+  "我们", "之前", "需要", "代码", "工作", "文件", "系统", "支持", "情况", "怎么", "如何", "是否",
+  "一个", "两个", "什么", "还有", "能够", "可以", "确认", "应该", "自己", "打开", "运行",
+]);
+const RECALL_INTENT_GROUPS = [
+  ["去重", "重复", "dedup", "deduplicate"], ["编号", "id"], ["名字", "名称", "显示名", "name"],
+  ["加载", "实载", "热重载", "reload", "hmr", "import"], ["版本号", "版本", "version"],
+  ["清单", "manifest"], ["安装", "install"], ["cookie"], ["调用", "call"], ["统计", "统计量", "次数"],
+  ["开关", "toggle"], ["入口", "槽位", "slot"], ["重启", "restart"], ["备份", "backup"],
+];
+
+/** 可解释的词法认证，不把稀有 bigram 或泛化的 DSH 片名当成语义置信度。 */
+function assessRecall(plan, row, { entityInBody, entitySubject, bodyHits, inferredSubject }) {
+  const fail = (reason, facets = []) => ({ eligible: false, reason, topicFacets: facets });
+  if (inferredSubject && !entitySubject) return fail("subject-alias-needs-confirmation");
+  if (!bodyHits.length) return fail("alias-only-body-match");
+  const intents = RECALL_INTENT_GROUPS.filter((group) => group.some((t) => searchTermPresent(plan.normalized, t)));
+  if (intents.some((group) => !group.some((t) => searchTermPresent(row.bodyHay, t)))) return fail("intent-not-in-body");
+  if (plan.identifiers.length) {
+    if (!entityInBody) return fail("entity-only-in-context-or-alias");
+    const entityWords = new Set(plan.identifiers.flatMap((a) => [searchNorm(a), ...identifierParts(a)]));
+    if (!bodyHits.some((t) => !entityWords.has(t) && !isStopSearchToken(t))) return fail("entity-without-body-intent");
+    return { eligible: true, reason: "exact-entity-and-intent", topicFacets: plan.identifiers };
+  }
+  const facets = [];
+  const covered = new Set();
+  for (const group of plan.groups) {
+    group.flatMap((t) => lexicalSearchTokens(t)).forEach((t) => covered.add(t));
+    group.forEach((t) => covered.add(t));
+    if (group.some((t) => searchTermPresent(row.contextHay, t)) && group.some((t) => searchTermPresent(row.bodyHay, t))) {
+      facets.push(group[0]);
+    }
+  }
+  // 相邻重叠的中文双字片段合成一个证据，不能把“自定/定义”计成两份独立支持。
+  const spans = [];
+  for (const t of plan.core) {
+    if (covered.has(t) || RECALL_GENERIC_TOPIC.has(t) || !searchTermPresent(row.contextHay, t) || !searchTermPresent(row.bodyHay, t)) continue;
+    const at = plan.normalized.indexOf(t);
+    if (at >= 0) spans.push({ start: at, end: at + t.length, text: t });
+  }
+  spans.sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && span.start < last.end) last.end = Math.max(last.end, span.end);
+    else merged.push({ ...span });
+  }
+  facets.push(...merged.map((span) => plan.normalized.slice(span.start, span.end)));
+  if (facets.length < 2) return fail("insufficient-independent-topic-evidence", facets);
+  return { eligible: true, reason: "independent-topics-and-body-intent", topicFacets: facets };
+}
+
+/** 返回的是原文片段，不是生成式摘要；每个片段都附实际行区间及截断状态。 */
+function entryEvidence(row, anchors, maxChars = SEARCH_EVIDENCE_CHARS) {
+  const original = row.original ?? row.flat;
+  if (original.length <= maxChars) {
+    return { text: original, lineStart: row.line, lineEnd: row.endLine ?? row.line, complete: true, truncated: false };
+  }
+  // 归一化命中必须映回原始字符偏移（全角标识符/组合字符长度可能改变）。
+  let hay;
+  let offsets;
+  if (/^[\x00-\x7f]*$/.test(original)) {
+    hay = original.toLowerCase();
+  } else {
+    const parts = [];
+    offsets = [];
+    for (const segment of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(original)) {
+      const normalized = searchNorm(segment.segment);
+      parts.push(normalized);
+      for (let i = 0; i < normalized.length; i += 1) offsets.push(segment.index);
+    }
+    hay = parts.join("");
+  }
+  let at = -1;
+  for (const t of anchors) {
+    const pattern = /^[a-z0-9 _.-]+$/i.test(t) ? identifierPattern(t, false) : null;
+    at = pattern ? (pattern.exec(hay)?.index ?? -1) : hay.indexOf(t);
+    if (at >= 0) break;
+  }
+  if (at >= 0 && offsets) at = offsets[at];
+  const start = Math.max(0, (at < 0 ? 0 : at) - SEARCH_PREVIEW_PAD);
+  const end = Math.min(original.length, start + maxChars);
+  const lineStart = row.line + original.slice(0, start).split("\n").length - 1;
+  const lineEnd = lineStart + original.slice(start, end).split("\n").length - 1;
+  return {
+    text: `${start > 0 ? "…" : ""}${original.slice(start, end)}${end < original.length ? "…" : ""}`,
+    lineStart, lineEnd, complete: false, truncated: true,
+  };
+}
+
+/** 原有函数保留可直接回退；增强路径仅复用它的一次读盘及条目解析。 */
+function searchMemory(query, options = {}) {
+  const settings = readSettings();
+  if ((options.mode ?? settings.searchMode) === "legacy") return searchMemoryLegacy(query, options);
+  const raw = String(query ?? "").trim();
+  if (raw.length > 8192) return { ok: false, error: "query too long: maximum 8192 characters" };
+  const plan = enhancedQuery(raw);
+  if (plan.identifiers.length > 32) return { ok: false, error: "too many identifiers: maximum 32; split the query" };
+  let pool;
+  const baseline = searchMemoryLegacy(query, { ...options, limit: 20 }, (value) => { pool = value; return true; });
+  if (!baseline.ok || !pool) return baseline;
+  const limit = Number.isFinite(options.limit) ? Math.max(1, Math.min(20, Math.trunc(options.limit))) : 8;
+  // 自动召回严格遵守注入开关。手动检索沿用历史语义：开关只管注入，不删除可搜索内容。
+  const enabled = (layer) => !options.enabledOnly || (layer === "global"
+    ? settings.globalEnabled : settings.projectEnabled?.[layer.slice("project:".length)] !== false);
+  const rows = pool.rows.filter((r) => enabled(r.layer)).map((r) => ({ ...r,
+    bodyHay: identifierHay(r.original), contextHay: identifierHay(`${r.heading} ${r.context}`) }));
+  const views = pool.shardViews.filter((v) => enabled(v.layer)).map((v) => ({
+    ...v, hay: identifierHay(`${v.name} ${v.keywords} ${v.path.split("/").pop()}`),
+  }));
+  const entityPatterns = plan.identifiers.map((a) => identifierPattern(a));
+  const resolvedAliases = subjectAliases(plan.identifiers, views);
+  const entityPaths = entityPatterns.map((p, i) => new Set([
+    ...rows.filter((r) => p.test(`${r.bodyHay} ${r.contextHay}`)).map((r) => r.path),
+    ...views.filter((v) => p.test(v.hay)).map((v) => v.path),
+    ...resolvedAliases.filter((a) => a.requested === plan.identifiers[i]).map((a) => a.path),
+  ]));
+  const identifierTerms = new Set(plan.identifiers.flatMap((a) => [searchNorm(a), ...identifierParts(a)]));
+  const scanned = { files: views.length, entries: rows.length, scope: pool.scoped ? "current" : "all" };
+  const dropped = { capped: 0, backfilled: 0, offScopeLayers: pool.offScopeLayers, offScopeFiles: pool.offScopeFiles };
+  const unmatchedAnchors = plan.identifiers.filter((_a, i) => entityPaths[i].size === 0);
+  const empty = (status) => ({ ok: true, query: raw, results: [], bridge: [], scanned, totalHits: 0,
+    dropped: { ...dropped, ...(status === "no-content-tokens" ? { emptyReason: status } : {}) },
+    mode: "enhanced", status, unmatchedAnchors, expandedTerms: plan.expanded, resolvedAliases });
+  // df=0 的中文碎片可以忽略；用户指定的技术实体不能因此被静默删掉。
+  if (unmatchedAnchors.length) return empty("anchor-missing");
+  if (!plan.core.length) return empty("no-content-tokens");
+
+  const terms = [...plan.core, ...plan.expanded];
+  const patterns = terms.map((t) => /^[a-z0-9 _.-]+$/i.test(t) ? identifierPattern(t, false) : null);
+  const hit = (hay, i) => patterns[i] ? patterns[i].test(hay) : hay.includes(terms[i]);
+  const df = new Array(terms.length).fill(0);
+  for (const r of rows) {
+    r.bodyMatches = terms.map((_t, i) => hit(r.bodyHay, i));
+    r.contextMatches = terms.map((_t, i) => hit(r.contextHay, i));
+    r.bodyMatches.forEach((matched, i) => { if (matched) df[i] += 1; });
+  }
+  const weights = df.map((n) => n > 0 ? Math.log(1 + rows.length / n) : 0);
+  const validCore = plan.core.filter((_t, i) => df[i] > 0);
+  const required = lexicalRequiredMatchCount(validCore);
+  const avgLen = rows.reduce((n, r) => n + r.norm.length, 0) / Math.max(1, rows.length) || 1;
+  const candidates = [];
+  for (const r of rows) {
+    const directEntity = entityPatterns.every((p) => p.test(`${r.bodyHay} ${r.contextHay}`));
+    const aliasesHere = resolvedAliases.filter((a) => a.path === r.path);
+    if (!directEntity) {
+      const intentHits = plan.core.filter((t, i) => !identifierTerms.has(t) && r.bodyMatches[i]).length;
+      const canonicalInBody = aliasesHere.some((a) => hasIdentifier(r.bodyHay, a.canonical));
+      // 声明名称派生的简称只允许在对应主题片里找有正文证据的候选，不放宽全库边界。
+      const aliasEvidence = aliasesHere.length > 0 && (intentHits > 0 || canonicalInBody);
+      if (!entityPaths.every((paths) => paths.has(r.path)) || (!aliasEvidence && intentHits < 2)) continue;
+    }
+    const bodyHits = [];
+    const aliasHits = [];
+    const contextHits = [];
+    let bodyScore = 0;
+    for (let i = 0; i < terms.length; i += 1) {
+      const t = terms[i];
+      const inBody = r.bodyMatches[i];
+      if (inBody) {
+        (i < plan.core.length ? bodyHits : aliasHits).push(t);
+        bodyScore += weights[i] * (i < plan.core.length ? 1 : 0.35);
+      }
+      if (r.contextMatches[i]) contextHits.push(t);
+    }
+    // 上下文可补路由，但不能凭片名让一条毫无正文证据的条目成为“事实命中”。
+    if (!bodyHits.length && !aliasHits.length) continue;
+    if (bodyHits.length < required && !(aliasHits.length && contextHits.length)) continue;
+    const exact = r.norm.includes(plan.normalized);
+    if (exact) bodyScore += Math.log(1 + rows.length);
+    const entityInBody = entityPatterns.length > 0 && entityPatterns.every((p) => p.test(r.bodyHay));
+    const entitySubject = entityPatterns.length > 0 && entityPatterns.every((p) => p.test(r.contextHay));
+    const contextBonus = Math.min(3, contextHits.length * 0.45) + (entitySubject ? 2 : 0) + (aliasesHere.length ? 2 : 0);
+    const lengthNorm = Math.max(0.8, 1 + 0.2 * (r.norm.length / avgLen - 1));
+    const rankedAnchors = [...bodyHits, ...aliasHits].sort((a, b) => weights[terms.indexOf(b)] - weights[terms.indexOf(a)]);
+    const recall = assessRecall(plan, r, { entityInBody, entitySubject, bodyHits,
+      inferredSubject: resolvedAliases.some((a) => a.kind === "subject-suffix") });
+    candidates.push({
+      path: r.path, shard: r.shard, layer: r.layer, line: r.line, date: r.date,
+      score: +((bodyScore + contextBonus) / lengthNorm).toFixed(4), shardBonus: r.shardBonus,
+      _row: r, _anchors: rankedAnchors, kind: "entry", confidence: recall.eligible ? "high" : "candidate", recall,
+      matchedTerms: bodyHits, aliasMatches: aliasHits, contextMatches: contextHits,
+      subjectAliases: aliasesHere.map(({ requested, canonical }) => ({ requested, canonical })),
+    });
+  }
+  const compare = (a, b) => b.score - a.score || b.shardBonus - a.shardBonus
+    || (b.date || "").localeCompare(a.date || "") || a.path.localeCompare(b.path) || a.line - b.line;
+  candidates.sort(compare);
+  const picked = [];
+  const perPath = new Map();
+  for (const r of candidates) {
+    if ((perPath.get(r.path) ?? 0) >= PER_SHARD_MAX) { dropped.capped += 1; continue; }
+    picked.push(r);
+    perPath.set(r.path, (perPath.get(r.path) ?? 0) + 1);
+    if (picked.length >= limit) break;
+  }
+  if (picked.length < limit) {
+    const seen = new Set(picked);
+    for (const r of candidates) {
+      if (picked.length >= limit) break;
+      if (seen.has(r)) continue;
+      picked.push(r); seen.add(r); dropped.backfilled += 1;
+    }
+  }
+  picked.sort(compare);
+  for (const r of picked) {
+    r.evidence = entryEvidence(r._row, r._anchors);
+    r.text = r.evidence.text;
+    delete r._row; delete r._anchors;
+  }
+  const bridge = [];
+  // 片级 df 只算一遍，避免每个候选再扫描全部分片的平方复杂度。
+  const shardDf = new Array(terms.length).fill(0);
+  for (const v of views) {
+    v.matches = terms.map((_t, i) => hit(v.hay, i));
+    v.matches.forEach((matched, i) => { if (matched) shardDf[i] += 1; });
+  }
+  for (const v of views) {
+    if (!entityPatterns.every((p, i) => p.test(v.hay) || entityPaths[i].has(v.path))) continue;
+    const coreHits = plan.core.filter((_t, i) => v.matches[i]);
+    const aliasHits = plan.expanded.filter((_t, i) => v.matches[plan.core.length + i]);
+    if (!coreHits.length && !aliasHits.length) continue;
+    let score = coreHits.reduce((n, t) => n + Math.log(1 + views.length / Math.max(1, shardDf[terms.indexOf(t)])), 0);
+    score += Math.min(3, aliasHits.length * 0.35);
+    if (plan.identifiers.length) score += 4;
+    const namedAliases = resolvedAliases.filter((a) => a.path === v.path);
+    if (namedAliases.length) score += 4;
+    bridge.push({ path: v.path, name: v.name, keywords: v.keywords.slice(0, BRIDGE_KEYWORDS_MAX),
+      latest: v.latest, size: v.size, over: v.size > SHARD_WARN_CHARS, score: +score.toFixed(2),
+      hits: [...coreHits, ...aliasHits], kind: "route", evidence: false,
+      subjectAliases: namedAliases.map(({ requested, canonical }) => ({ requested, canonical })) });
+  }
+  bridge.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+  return { ok: true, query: raw, results: picked, bridge: bridge.slice(0, BRIDGE_TOP), scanned,
+    totalHits: candidates.length, dropped, mode: "enhanced", status: picked.length ? "matched" : bridge.length ? "route-only" : "no-match",
+    unmatchedAnchors: [], expandedTerms: plan.expanded, resolvedAliases };
+}
+
 /**
  * 渲染**片级桥**段（v0.9.4）。`mapless` 档下常驻地图不注入了，这一段就是模型唯一的路由地图，
  * 所以措辞必须自己把「读完再决定 read 哪片」这条动作链说全。
@@ -1315,12 +1708,13 @@ function renderBridgeLines(value, coveredPaths) {
     const mark = coveredPaths.has(b.path) ? "*" : " ";
     const words = b.hits && b.hits.length ? ` · 沾词 ${b.hits.slice(0, 4).join("/")}` : "";
     const fresh = b.latest ? ` · 最新 ${b.latest}` : "";
+    const subject = b.subjectAliases?.length ? ` · 名称简称 ${b.subjectAliases.map((a) => `${a.requested}（${a.canonical}）`).join("、")}` : "";
     // 治理信号：mapless 档没有常驻地图，`⚠️超建议` 只能在这里给（对照 map 档的 shardHeadLine）
     const warn = b.over ? ` ⚠️超建议${SHARD_WARN_CHARS}，读完顺手按子主题拆片` : "";
-    out.push(`${i + 1}.${mark} [${b.score}] ${b.name}${fresh}${words} → ${b.path}${warn}`);
+    out.push(`${i + 1}.${mark} [${b.score}] ${b.name}${fresh}${words}${subject} → ${b.path}${warn}`);
     if (b.keywords) out.push(`       关键词：${b.keywords}`);
   });
-  out.push("（`*` = 上面条目结果已出自该片，不必重复 read 同一片）");
+  out.push("（`*` = 上面已有该片的条目候选，不表示已经读完整；截断条目仍须按行 read，不必再整片重读）");
   out.push("→ 先看关键词判断该读哪片，再 read path=<上面路径> offset=<条目行号>；片名与关键词只说明主题，不保证内容。");
   out.push("→ 若这些片都不是你要的：说明 query 与记忆之间存在词汇鸿沟，换更专的词（英文插件名 / 文件名 / 报错码 / 设置键名）重搜一次。");
   return out;
@@ -1329,6 +1723,9 @@ function renderBridgeLines(value, coveredPaths) {
 /** 把检索结果渲染成模型可读文本（工具 output.render 用）。 */
 function formatSearchResults(value) {
   if (!value || value.ok !== true) return `memory_search 失败：${value?.error ?? "unknown"}`;
+  if (value.status === "anchor-missing") {
+    return `memory_search：指定实体未命中：${value.unmatchedAnchors.join("、")}。未用“配置/修改”等通用词替代实体返回无关事实。核对拼写或显式改写实体；跨项目查找可带 scope:"all"。`;
+  }
   // 「少给了多少」必须可见：默认作用域只扫当前项目层，跨项目的东西不写出来就像凭空消失。
   const scopeNote =
     value.scanned.scope === "current"
@@ -1356,13 +1753,19 @@ function formatSearchResults(value) {
     }
     return `memory_search：无命中（扫描 ${value.scanned.files} 个文件 / ${value.scanned.entries} 条条目${scopeNote}）。换关键词重试，或用 grep 做精确正则；要找别的项目的记忆就带 scope:"all"。`;
   }
-  const rows = value.results.map(
-    (r, i) => `${i + 1}. [score ${r.score}] ${r.path}:${r.line}${r.date ? ` [${r.date}]` : ""}\n   ${r.text}`,
-  );
+  const rows = value.results.map((r, i) => {
+    const e = r.evidence;
+    const location = e ? `${e.lineStart}${e.lineEnd > e.lineStart ? `-${e.lineEnd}` : ""}` : r.line;
+    const state = e ? (e.complete ? " · 完整原文" : ` · 截断，完整条目从 L${r.line} 起`) : "";
+    const aliases = r.aliasMatches?.length ? ` · 别名：${r.aliasMatches.slice(0, 3).join("/")}` : "";
+    return `${i + 1}. [score ${r.score}${state}${aliases}] ${r.path}:${location}${r.date ? ` [${r.date}]` : ""}\n   ${r.text}`;
+  });
   return [
     `memory_search：共 ${value.totalHits} 条命中（显示前 ${value.results.length} 条；扫描 ${value.scanned.files} 文件 / ${value.scanned.entries} 条目${scopeNote}${capNote}），按相关度排序${broadNote}。`,
     ...rows,
-    "→ read 对应文件的行号取上下文；条目行号即记忆纪律里的 L 号。",
+    value.mode === "enhanced"
+      ? "→ 完整原文可直接核对使用；截断条目按其起始行 read 补全。分片线索仅用于路由，不是事实证据；历史记忆仍需核实现状。"
+      : "→ read 对应文件的行号取上下文；条目行号即记忆纪律里的 L 号。",
     ...renderBridgeLines(value, covered),
   ].join("\n");
 }
@@ -1540,6 +1943,9 @@ function renderShardFull(header, files) {
 /**
  * 项目层（**目录形式**）的注入正文。
  *
+ * 注意：`mapless` 档**不走这里**（见 renderProjectPointer）—— 该档只给一行指针，
+ * 索引摘要改由 memory_search 现算。本函数服务于 map / index 两档。
+ *
  * 与全局层 / 单文件形式刻意不同：项目目录里索引与正文已经分好家 —— `MEMORY.md` 是人写的
  * 索引（`- [标题](文件.md) — 摘要`，本身就是「标题 → 路径」），其余 `.md` 是正文（带 YAML
  * frontmatter 的段落，不是条目）。所以这里直接注入索引正文，另外只列出**没被索引登记的**
@@ -1587,6 +1993,43 @@ function renderProjectDir(cwd, dir) {
   parts.push("", `<!-- 写入本层：正文写进对应主题文件，并在 MEMORY.md 补一行 \`- [标题](文件.md) — 摘要\` -->`);
   parts.push("", `<!-- 本层：索引 ${entries} 条 / 正文 ${others.length} 篇 -->`);
   return parts.join("\n");
+}
+
+/**
+ * 项目层（**目录形态**）在 `mapless` 档下的注入：一段固定指针，索引不常驻。
+ *
+ * 背景：`renderProjectDir` 会把 MEMORY.md 整篇注入（只受 maxChars 截断）。单项目几十条时
+ * 这值得 —— 人写的摘要就是路由信息。但 2026-10 实测 WallHaven：114 条 / 37,441 字符，
+ * clamp 后仍 24,000 字符正文 + 4,000 字符溢出索引，每个请求都付，比全局层那 188 片地图还贵。
+ * 本档的赌注与全局层一致：摘要照样是检索语料（`layerFiles` 收目录里**全部** .md，含
+ * MEMORY.md），只是不常驻；路由改由 `memory_search` 返回的「相关记忆片」按 query 现算。
+ *
+ * 头行只放固定内容（cwd / 路径）—— 条数放尾部注释，否则写一条记忆就改前缀、毁 KV 缓存
+ * （理由同 renderMap）。
+ *
+ * @param {string} cwd - 工作目录（写进注释头）。
+ * @param {string} dir - 该项目记忆目录。
+ * @returns {string} 注入正文（恒非空：目录存在即给指针）。
+ */
+function renderProjectPointer(cwd, dir) {
+  const indexPath = `${dir}/MEMORY.md`;
+  let entries = 0;
+  let shards = 0;
+  try {
+    entries = (readOrEmpty(indexPath).match(/^\s*-\s*\[/gm) ?? []).length;
+    shards = readdirSync(dir).filter((n) => n.endsWith(".md") && n !== "MEMORY.md").length;
+  } catch {
+    /* 统计失败就按 0 写：指针本身仍然有效，别因为没有数字就不给路 */
+  }
+  return [
+    `<!-- 项目记忆 · ${cwd} · 目录形式 · mapless：索引不常驻（摘要仍是检索语料，先 memory_search 取条目） -->`,
+    "",
+    `## 项目记忆 · ${cwd} → ${indexPath}`,
+    "",
+    `<!-- 本层：索引 ${entries} 条 / 正文 ${shards} 篇 · 先 memory_search（scope 默认 current 已含本项目，返回里的「相关记忆片」即路由）→ read 命中片路径；搜不到换词再搜，仍无命中才 grep ${dir} -->`,
+    "",
+    `<!-- 写入本层：正文写进对应主题文件，并在 MEMORY.md 补一行 \`- [标题](文件.md) — 摘要\` -->`,
+  ].join("\n");
 }
 
 /**
@@ -1659,23 +2102,27 @@ function compose(context) {
   }
 
   // ── 项目层 ──────────────────────────────────────────────────────────────
-  const cwd = context?.agent?.session?.header?.cwd;
+  const cwd = readAgentCwd(context?.agent);
   if (typeof cwd === "string" && cwd.length > 0) {
     const slug = slugOf(cwd);
     if (values.projectEnabled?.[slug] !== false) {
       const dir = `${PROJECT_DIR}/${slug}`;
       const indexPath = `${dir}/MEMORY.md`;
       const filePath = `${PROJECT_DIR}/${slug}.md`;
-      // 项目层在 mapless 下**照旧注入**（不当作"地图"砍掉）：它只有几条到几十条，
-      // 且目录形态的 MEMORY.md 是人写的摘要 —— 比自动索引值钱，固定成本也就几 k 字符。
-      // 真正吃掉 token 的是全局层那 188 片地图，所以本档只砍全局层。
-      // 归一成 "map" 走同一条渲染路径（小层逐条内联 / 目录形态整篇注入），避免行为分叉。
+      // 项目层分两种形态，本档只收起其中贵的那个：
+      //   · 目录形态（人写 MEMORY.md + 每片正文）：**也收起**（v0.9.5）。原先的理由是
+      //     「只几十条、几 k 字符」—— 实测 WallHaven 已到 114 条 / 37k 字符，clamp 后
+      //     仍 24k 正文 + 4k 溢出索引，比全局层那 188 片地图还贵。摘要仍是检索语料
+      //     （layerFiles 收目录里全部 .md，含 MEMORY.md），只是不常驻 → renderProjectPointer。
+      //   · 单文件形态：条目 ≤ 12 逐条内联、> 12 走片级地图，本来就小，保持原样。
+      const dirShape = isDir(dir);
       const projMode = mode === "mapless" ? "map" : mode;
-      if (projMode !== "full") {
-        // 目录形式：MEMORY.md 已是人写索引，走「索引正文 + 孤儿正文清单」——地图模式同样整篇保留它
-        // （人写的摘要是路由信息，比自动索引更值钱，本来也只有几 k 字符）
-        // 单文件形式：本身就是条目集合，按当前模式渲染（条目少时地图模式仍逐条内联）
-        const dirShape = isDir(dir);
+      if (mode === "mapless" && dirShape) {
+        blocks.push(neutralizePromptVars(renderProjectPointer(cwd, dir)));
+      } else if (projMode !== "full") {
+        // 目录形式：MEMORY.md 已是人写索引，走「索引正文 + 孤儿正文清单」—— 地图 / 索引档
+        // 仍整篇保留它（人写的摘要是路由信息），超预算部分由 clamp 转成溢出索引。
+        // 单文件形式：本身就是条目集合，按当前模式渲染（条目少时地图模式仍逐条内联）。
         const body = dirShape
           ? renderProjectDir(cwd, dir)
           : renderLayer(projMode, `项目记忆 · ${cwd}`, layerFiles("", filePath));
@@ -2743,7 +3190,7 @@ async function postExecuteHook(exec, result, next) {
  */
 const DISCIPLINE_HEAD = {
   mapless: [
-    "     · 【开工先查】非琐碎任务开头先调 `memory_search`（拿任务里的关键词：框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）；返回里的「相关记忆片」段就是路由地图（按 query 现算的 top8 片名+关键词），据此判断该读哪片，再 `read path=<片> offset=<行号>` 取原文。命中条目/行号才动手，没命中就不读，别整库通读。**全局记忆这一层没有常驻目录**（项目层若有自己的地图段落，按那一段的指引读它）",
+    "     · 【开工先查】非琐碎任务开头先调 `memory_search`（拿任务里的关键词：框架 / 工具 / 文件名 / 报错码 / 用户原话里的名词）；返回里的「相关记忆片」段就是路由地图（按 query 现算的 top8 片名+关键词），据此判断该读哪片，再 `read path=<片> offset=<行号>` 取原文。命中条目/行号才动手，没命中就不读，别整库通读。**全局记忆与目录形态的项目记忆都没有常驻索引**（只有单文件形态的小项目层可能自带逐条内联 / 地图段落，按那一段的指引读它）",
     "     · 【搜偏了】本机的坑是中文口语 ↔ 英文专名的词汇鸿沟（「外网连回」搜不到 remote-access、「状态条文案」搜不到 effort-slider）：首次搜索若只返回无关条目，先换更专的词（英文插件名 / 文件名 / 报错码 / 设置键名）再搜一次，仍无命中才用 `grep pattern=\"<关键词>\" path=\"~/.dsh/memory\"` 兜底",
   ],
   map: [
@@ -3201,11 +3648,74 @@ async function handleRoute(req, res) {
   }
 }
 
+// 自动召回不保存查询/正文、不写日志；WeakMap 随 Agent 回收，仅记当前轮是否预检过。
+const recallStates = new WeakMap();
+const AUTO_RECALL_BUDGET = 1800;
+
+/** 只处理直接用户输入；每轮最多一次，失败/取消/无可靠候选均保留原有模型流程。 */
+async function autoRecallHook(payload, next) {
+  const decision = await next();
+  if (decision?.kind !== "enter" || payload?.signal?.aborted) return decision;
+  try {
+    const values = readSettings();
+    if (!values.autoRecall || values.searchMode === "legacy" || values.injectMode === "full") return decision;
+    const agent = payload?.agent;
+    if (!agent || typeof agent !== "object") return decision;
+    const header = agent.session?.header ?? {};
+    if (header.origin === "subagent" || header.delegationDepth > 0 || summonGuardHit(agent.id ?? header.id)) return decision;
+    // 尊重下游已经删空/改写的消息；不能用最初 payload 把被抑制的用户输入复活。
+    const users = (decision.messages ?? []).filter((m) => m?.source?.kind === "user" && m.role === "user");
+    if (!users.length) return decision;
+    const prior = recallStates.get(agent);
+    if (prior?.turn === payload.turn) return decision;
+    const raw = users.flatMap((m) => (m.content ?? []).filter((b) => b.type === "text").map((b) => String(b.text ?? ""))).join("\n").trim();
+    if (raw.length < 4 || /^(?:你好|谢谢|好的?|可以|继续|收到|嗯|ok|thanks|hello|hi)[！!。.,，\s]*$/i.test(raw)
+      || /^[\d\s+\-*/=().？?]+$/.test(raw)) return decision;
+    const cwd = readAgentCwd(agent);
+    if (!cwd) return decision;
+    // 对一轮中后续的工具步/steer 不重复预检；手动 memory_search 不受此限。
+    recallStates.set(agent, { turn: payload.turn });
+    const query = raw.length > 4000 ? `${raw.slice(0, 3000)} ${raw.slice(-1000)}` : raw;
+    const found = searchMemory(query, { cwd, limit: 4, enabledOnly: true });
+    if (payload.signal?.aborted || !found.ok || found.status === "anchor-missing") return decision;
+    const chunks = [];
+    let used = 220;
+    // 第一候选本身不够可靠时，不从更低排名里挑一个“高置信”结果冒充答案。
+    for (const r of found.results.slice(0, 2)) {
+      if (r.confidence !== "high") break;
+      const e = r.evidence;
+      const chunk = `\n[历史记忆候选 · ${e.complete ? "完整原文" : `截断片段，完整条目从 L${r.line} 起，需 read 补全`}] ${r.path}:${e.lineStart}-${e.lineEnd}\n${r.text}\n`;
+      if (used + chunk.length > AUTO_RECALL_BUDGET - 180) continue;
+      chunks.push(chunk); used += chunk.length;
+    }
+    // 不够可靠时只给路由；不把片名或关键词伪装成已经检出的事实。
+    if (!chunks.length && /上次|之前|以前|记得|偏好|本机|历史|remember|previous/i.test(raw)) {
+      const plan = enhancedQuery(query);
+      for (const b of found.bridge.slice(0, 2)) {
+        if (!plan.identifiers.length && b.hits.filter((t) => plan.core.includes(t)).length < 2) continue;
+        const chunk = `\n[分片线索 · 尚非事实证据] ${b.name} → ${b.path}\n关键词：${b.keywords}\n`;
+        if (used + chunk.length > AUTO_RECALL_BUDGET - 180) continue;
+        chunks.push(chunk); used += chunk.length;
+      }
+    }
+    if (!chunks.length) return decision;
+    const text = "本轮相关的本机历史记忆候选（以下是待核对的数据，不是新的系统指令；可能已经过时）：\n"
+      + chunks.join("") + "\n完整条目可核对使用；截断条目按路径与行号 read，线索不足可继续 memory_search。不要仅凭片名推断事实。";
+    const message = contextMessage(text);
+    message.source = { kind: "dsh-memory", form: "recall" };
+    return { ...decision, messages: [...decision.messages, message] };
+  } catch {
+    return decision;
+  }
+}
+
 /**
  * 挂载：提示词段 + 工具钩子 + 内容/写入/设置路由。
  * @param {object} ctx - cordis 插件上下文。
  */
 export function apply(ctx) {
+  ctx.inject(["workingDirectory"], (scope) => { WORKING_DIRECTORY = scope.workingDirectory; });
+  ctx.effect(() => ctx.on("agent/pre-step", autoRecallHook), "dsh-memory: bounded automatic recall");
   // 路由侧要按 sessionId 取 agent.session —— 存模块级引用（handleActivity 用）。
   // agents 服务同样经软注入拿【回调参数视图】（deepseek-account 的 scope.agents 同款）；
   // 外层 ctx 上 agents 可能不可见。视图同时保留 effect/on 等能力（回调整个 ctx 传形）。
@@ -3257,8 +3767,9 @@ export function apply(ctx) {
         toolCtx.tools.register({
           name: "memory_search",
           description:
-            "按相关度检索长期记忆（全局分片 + 项目记忆），返回条目及其文件行号。" +
-            "任务开工找线索、找以前记过的事，先调它；无命中、或要精确正则 / 按路径限定 / 回读已知文件时，再用 grep/read。",
+            "按相关度检索长期记忆（全局分片 + 当前项目），返回原文、行号与完整/截断标记。" +
+            "涉及本机环境、历史决策、用户偏好或继续旧任务时先查；保留文件名/工具名/错误码等精确实体。" +
+            "完整条目可直接核对，截断条目用 read 补全；分片线索不是事实。无命中可换中文口语/英文术语再试，跨项目显式 scope:all。",
           parameters: {
             type: "object",
             properties: {
@@ -3277,13 +3788,15 @@ export function apply(ctx) {
             schema: { type: "object", additionalProperties: true },
             render: (_args, value) => [{ type: "text", text: formatSearchResults(value) }],
           },
-          // exec.agent 是宿主契约（packages/core/tools/src/index.ts:340「The agent on whose
-          // behalf the call runs」，可选字段）；cwd 走 compose() 同一条链
-          // （agent.session.header.cwd，packages/core/session/src/types.ts:106）。
-          // 任一环取不到 → cwd 为空串 → searchMemory 自动退回全库，绝不静默少给。
+          // 工具与 compose/自动召回共用宿主 workingDirectory 当前投影。
+          // 有 Agent 但目录服务失败时不扩大 current；仅旧宿主无服务回落 header。
+          // 无 Agent 的直接调用保留历史全库兼容，跨项目可显式 scope:"all"。
           execute: async (args, exec) => {
             const limit = Number.isFinite(args?.limit) ? args.limit : undefined;
-            const cwd = exec?.agent?.session?.header?.cwd;
+            const cwd = readAgentCwd(exec?.agent);
+            if (exec?.agent && !cwd && args?.scope !== "all") {
+              return { ok: false, error: "当前会话工作目录不可用，未扩大到其它项目；恢复目录后重试，或明确指定 scope:all。" };
+            }
             return searchMemory(String(args?.query ?? ""), {
               limit,
               scope: args?.scope === "all" ? "all" : undefined,

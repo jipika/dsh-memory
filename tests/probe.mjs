@@ -292,10 +292,26 @@ store.injectMode = "mapless";
 const less = at(CWD);
 check(less.includes("全局记忆") && less.includes("memory_search"), "mapless: 注入指针块（告诉模型有记忆、怎么搜）");
 check(!less.includes("## 探针分片"), "mapless: 全局层片级地图不注入（不列片名行）");
-check(!less.includes("记忆**没有**常驻索引"), "mapless: 指针块不用全称否定（项目层可能自带地图，全称必与它打脸）");
+check(!less.includes("记忆**没有**常驻索引"), "mapless: 指针块不用全称否定（单文件项目层可能自带地图，全称必与它打脸）");
 check(!/- \[L\d+\]/.test(less), "mapless: 没有常驻条目行号表");
 check(less.includes("~/.dsh/memory/topics"), "mapless: 给出全局层根目录（否则模型写记忆时无路可循）");
-check(less.includes("probe project index entry"), "mapless: 项目层照旧注入（只有几条且是人写摘要，砍它不划算）");
+// v0.9.5：目录形态的项目层（人写 MEMORY.md 整篇注入）在本档也收起 —— 实测 WallHaven
+// 114 条 / 37k 字符，clamp 后仍 24k + 4k 溢出索引，比全局层地图还贵。
+check(!less.includes("probe project index entry"), "mapless: 目录形态项目层的 MEMORY.md 摘要不常驻（v0.9.5 起与全局层同档）");
+check(
+  less.includes("项目记忆") && less.includes(join(HOME, ".dsh/memory/projects", SLUG, "MEMORY.md")),
+  "mapless: 目录形态项目层只留一行指针（给出 MEMORY.md 路径，否则模型不知道索引在哪）",
+);
+check(
+  less.includes("MEMORY.md 补一行"),
+  "mapless: 指针里保留项目层写入格式提示（否则写记忆时无路可循）",
+);
+// 收起注入 ≠ 丢掉可检索性：目录形态的 MEMORY.md 与各片正文仍在 layerFiles 池里。
+const projHit = host.searchMemory("probe project index", { cwd: CWD, limit: 8 });
+check(
+  projHit.results.some((r) => String(r.path).includes(SLUG)),
+  "mapless: 目录形态项目层仍在检索池内（摘要不常驻的代价只有一次 round-trip）",
+);
 check(
   less.length < 2600,
   `mapless: 注入长度与全局记忆规模无关 = 本档存在理由（实际 ${less.length} 字符，含纪律块；对照 map 档随片数线性膨胀）`,
@@ -317,10 +333,10 @@ const BIG_SLUG = "--Users-probe-code-big--";
 mkdirSync(join(HOME, ".dsh/memory/projects"), { recursive: true });
 writeFileSync(join(HOME, ".dsh/memory/projects", `${BIG_SLUG}.md`), probeShard("探针大层项目片", 20));
 const lessBig = at(BIG_CWD);
-check(lessBig.includes("地图模式"), "mapless: 大项目层（>12 条）仍自带「地图模式」段（本档只砍全局层）");
+check(lessBig.includes("地图模式"), "mapless: 单文件大项目层（>12 条）仍自带「地图模式」段（本档只收起目录形态的大索引）");
 check(
   lessBig.includes("全局记忆") && !/记忆\*\*没有\*\*常驻索引|本档没有任何常驻目录/.test(lessBig),
-  "mapless: 指针块与纪律块的否定必须限定到全局层，不能全称 —— 否则与同份注入里项目层的「地图模式」矛盾",
+  "mapless: 指针块与纪律块的否定必须限定到全局层与目录形态项目层，不能全称 —— 否则与同份注入里单文件项目层的「地图模式」矛盾",
 );
 rmSync(join(HOME, ".dsh/memory/projects", `${BIG_SLUG}.md`));
 
@@ -333,8 +349,8 @@ writeFileSync(
   join(TOPICS, "v094-bridge-only.md"),
   "<!-- 远程调试桥 · 关键词：外网回连、内网穿透 -->\n\n# 远程调试桥\n- [2026-06-01] remote tunnel bridge fact\n",
 );
-const bOnly = host.searchMemory("外网回连", { limit: 8 });
-check(bOnly.results.length === 0, `mapless: 夹具正文不含查询词 → 条目级零命中（实际 ${bOnly.results.length} 条）`);
+const bOnly = host.searchMemory("外网回连", { limit: 8, mode: "legacy" });
+check(bOnly.results.length === 0, `mapless legacy: 夹具正文不含查询词 → 条目级零命中（实际 ${bOnly.results.length} 条）`);
 check(
   bOnly.bridge.some((b) => b.path.endsWith("v094-bridge-only.md")),
   "mapless: 桥按「片名+关键词」捞回该片（条目漏、桥到 = 本机实测 11/12 vs 7/12 的机制）",
@@ -906,7 +922,7 @@ store.writeHookCommand = "";
   check(none.ok === true && none.results.length === 0, "v0.8: 无命中返回空数组");
   check(host.searchMemory("").ok === false, "v0.8: 空 query 拒绝");
   const fmt = host.formatSearchResults(hit);
-  check(fmt.includes("read 对应文件的行号取上下文"), "v0.8: render 文本带读取指引");
+  check(fmt.includes("截断条目按其起始行 read 补全") && fmt.includes("完整原文"), "v2: render 区分完整原文与截断条目的读取指引");
 
   // ── v0.9.1 P0 三项：片级加分不再抬条目分 / per-shard 配额 / 作用域收窄 ──────────
   // ① 片名整句命中、条目零命中 → 旧实现给每条 entry +12 且用片名填满 hitTokens，
